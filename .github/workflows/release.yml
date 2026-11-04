@@ -22,6 +22,8 @@ jobs:
             asset: jans-launcher-windows-x86_64.exe
             updater_bin: jans-modpack-updater.exe
             updater_asset: jans-modpack-updater-windows-x86_64.exe
+            admin_bin: jans-pack-admin.exe
+            admin_asset: jans-pack-admin-windows-x86_64.exe
           # Oldest supported Ubuntu runner, so the binary works on older glibc distros too.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -29,6 +31,8 @@ jobs:
             asset: jans-launcher-linux-x86_64
             updater_bin: jans-modpack-updater
             updater_asset: jans-modpack-updater-linux-x86_64
+            admin_bin: jans-pack-admin
+            admin_asset: jans-pack-admin-linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +40,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test admin publication recovery
+        run: python scripts/test-admin-backend.py
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -53,6 +62,7 @@ jobs:
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.asset }}
           cp target/${{ matrix.target }}/release/${{ matrix.updater_bin }} dist/${{ matrix.updater_asset }}
+          cp target/${{ matrix.target }}/release/${{ matrix.admin_bin }} dist/${{ matrix.admin_asset }}
           if [ "${{ runner.os }}" = "Linux" ]; then
             mkdir -p pkg/jans-launcher
             cp target/${{ matrix.target }}/release/jans-launcher pkg/jans-launcher/

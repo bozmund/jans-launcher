@@ -27,9 +27,13 @@
             --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
           wrapProgram $out/bin/jans-modpack-updater \
             --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
+          wrapProgram $out/bin/jans-pack-admin \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs} \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 pkgs.git pkgs.gh pkgs.openssh ]}
           install -Dm644 assets/icon.png $out/share/icons/hicolor/256x256/apps/jans-launcher.png
           install -Dm644 packaging/jans-launcher.desktop $out/share/applications/jans-launcher.desktop
           install -Dm644 packaging/jans-modpack-updater.desktop $out/share/applications/jans-modpack-updater.desktop
+          install -Dm644 packaging/jans-pack-admin.desktop $out/share/applications/jans-pack-admin.desktop
         '';
       };
       devShells.${system}.default = pkgs.mkShell {

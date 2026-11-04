@@ -7,7 +7,11 @@ mod publish;
 mod source;
 mod sync;
 mod transaction;
+mod updater_background;
+mod updater_copy;
 mod updater_profiles;
+#[cfg(windows)]
+mod updater_tray;
 mod util;
 
 use anyhow::{Context, Result};
@@ -27,7 +31,7 @@ use updater_profiles::Profile;
     version,
     about = "Update Jan's Fabric 26.3 pack inside an existing Modrinth profile. Run without flags for the window."
 )]
-#[command(group(clap::ArgGroup::new("action").args(["check","update","list"]).multiple(false)))]
+#[command(group(clap::ArgGroup::new("action").args(["check","update","list","background","copy_from"]).multiple(false)))]
 struct Args {
     #[arg(long)]
     profile: Option<PathBuf>,
@@ -37,6 +41,12 @@ struct Args {
     update: bool,
     #[arg(long)]
     list: bool,
+    /// Run only the low-memory notification-area updater (requires enrollment in the window).
+    #[arg(long)]
+    background: bool,
+    /// Copy player files from an old profile into a new empty local --profile.
+    #[arg(long, requires = "profile")]
+    copy_from: Option<PathBuf>,
 }
 
 async fn check(client: &reqwest::Client, path: &std::path::Path) -> Result<sync::Changes> {
@@ -61,7 +71,14 @@ async fn apply(
 
 fn main() {
     let args = Args::parse();
-    if args.list || args.check || args.update {
+    if args.background {
+        if let Err(error) = updater_background::run() {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.list || args.check || args.update || args.copy_from.is_some() {
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::System::Console::AttachConsole(
@@ -71,6 +88,7 @@ fn main() {
         let result:Result<()>=tokio::runtime::Runtime::new().unwrap().block_on(async {
             if args.list {println!("{}",serde_json::to_string_pretty(&updater_profiles::discover()?)?);return Ok(());}
             let path=args.profile.context("Specify the existing Modrinth profile using --profile")?;
+            if let Some(source)=args.copy_from {let count=updater_copy::copy(&source,&path)?;println!("{}",serde_json::json!({"copied_files":count,"destination":path,"source_preserved":true}));return Ok(());}
             let client=util::http();let changes=check(&client,&path).await?;
             if args.update && !changes.up_to_date() {apply(&client,&path,&changes,Arc::new(|_,_,_|{})).await?;}
             println!("{}",serde_json::json!({"pack":changes.pack_name,"version":changes.new_version,"build":changes.new_build,"files":changes.manifest.files.len(),"download_bytes":changes.download_bytes,"actions":changes.actions.len(),"updated":args.update,"source_revision":changes.revision}));
@@ -107,6 +125,7 @@ enum Message {
     Profiles(Result<Vec<Profile>>),
     Checked(Result<sync::Changes>),
     Applied(Result<()>),
+    Copied(Result<usize>),
 }
 struct App {
     runtime: tokio::runtime::Runtime,
@@ -116,6 +135,7 @@ struct App {
     ctx: egui::Context,
     profiles: Vec<Profile>,
     selected: Option<PathBuf>,
+    copy_source: Option<PathBuf>,
     changes: Option<sync::Changes>,
     busy: bool,
     progress: Arc<Mutex<(String, u64, u64)>>,
@@ -148,6 +168,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             profiles: vec![],
             selected,
+            copy_source: None,
             changes: None,
             busy: false,
             progress: Arc::new(Mutex::new((String::new(), 0, 0))),
@@ -259,7 +280,16 @@ impl App {
                     self.status =
                         "Update installed. Check complete before opening Modrinth.".into();
                 }
-                Message::Profiles(Err(e)) | Message::Checked(Err(e)) | Message::Applied(Err(e)) => {
+                Message::Copied(Ok(count)) => {
+                    self.status = format!(
+                        "Copied {count} files. The old profile is preserved. Check for pack updates, then enable automatic updates."
+                    );
+                    self.changes = None;
+                }
+                Message::Profiles(Err(e))
+                | Message::Checked(Err(e))
+                | Message::Applied(Err(e))
+                | Message::Copied(Err(e)) => {
                     self.error = Some(format!("{e:#}"));
                     self.status =
                         "Operation did not complete. Read the error below and retry.".into();
@@ -299,6 +329,20 @@ impl eframe::App for App {
             });
             if let Some(path)=chosen{self.choose(path);}
             if let Some(path)=&self.selected {ui.label(RichText::new(path.display().to_string()).weak().size(12.0));}
+            egui::CollapsingHeader::new("One-time setup: independent copy of your old profile").show(ui,|ui|{
+                ui.label("1. Select the old profile above and click Use as source.");
+                ui.label("2. In Modrinth, create a NEW local Fabric 26.3 profile with the same loader. Keep it empty; do not duplicate/import the shared pack.");
+                ui.label("3. Refresh this list, select the new profile and click Copy everything. Close Minecraft first.");
+                if ui.add_enabled(!self.busy&&self.selected.is_some(),egui::Button::new("Use selected profile as source")).clicked(){self.copy_source=self.selected.clone();}
+                if let Some(source)=self.copy_source.clone(){
+                    ui.small(format!("Source (kept): {}",source.display()));
+                    if ui.add_enabled(!self.busy&&self.selected.as_ref().is_some_and(|p|p!=&source),egui::Button::new("Copy everything into selected new profile")).clicked(){
+                        let destination=self.selected.clone().unwrap();let send=self.sender();self.busy=true;self.error=None;self.status="Copying and verifying your profile; this may take several minutes…".into();
+                        self.runtime.spawn_blocking(move||send(Message::Copied(updater_copy::copy(&source,&destination))));
+                    }
+                }
+                ui.small("Copies mods, worlds, settings and personal files. Updater caches/locks stay separate. Linked files are refused. The old profile is never deleted.");
+            });
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy&&self.selected.is_some(),egui::Button::new("Check for updates")).clicked(){self.start_check();}
                 let available=self.changes.as_ref().is_some_and(|c|!c.up_to_date());
@@ -311,6 +355,22 @@ impl eframe::App for App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             }
             ui.label(&self.status);
+            ui.separator();
+            ui.label(RichText::new("AUTOMATIC UPDATES").strong());
+            ui.label("Check every 5 minutes in the Windows tray. Waits while Minecraft is running.");
+            let enrolled=updater_background::enrollment().ok().flatten();
+            let enabled=enrolled.as_ref().is_some_and(|e|e.enabled);
+            if let Some(e)=enrolled.filter(|e|e.enabled){ui.label(format!("Enabled for {}",e.profile.display()));}
+            ui.horizontal(|ui|{
+                if ui.add_enabled(cfg!(windows)&&!self.busy&&self.selected.is_some(),egui::Button::new("Enable automatic updates at login")).clicked(){
+                    match updater_background::enable(self.selected.as_ref().unwrap()){Ok(())=>self.status="Background updater enabled. You can close this window.".into(),Err(e)=>self.error=Some(format!("{e:#}"))}
+                }
+                if ui.add_enabled(enabled,egui::Button::new("Disable automatic updates")).clicked(){
+                    match updater_background::disable(){Ok(())=>self.status="Automatic updates and login startup disabled.".into(),Err(e)=>self.error=Some(format!("{e:#}"))}
+                }
+            });
+            if let Some(s)=updater_background::status(){ui.label(format!("Background: {}",s.message));if let Some(t)=s.last_check{ui.small(format!("Last check: {t}"));}if let Some(t)=s.last_update{ui.small(format!("Last update: {t}"));}}
+            if enabled {ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));}
             if let Some(error)=&self.error {ui.label(RichText::new(error).color(Color32::LIGHT_RED));}
             if let Some(changes)=self.changes.clone() {
                 ui.separator();

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Jan's Pack Admin
+Comment=Preview and publish Jan's modpack updates
+Exec=jans-pack-admin
+Icon=jans-launcher
+Terminal=false
+Type=Application
+Categories=Game;Utility;

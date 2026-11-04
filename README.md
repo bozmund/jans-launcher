@@ -49,6 +49,11 @@ information about what changed.
 
 ## For players
 
+For the Modrinth-based workflow, use **Jan's Modpack Updater**: make an independent local copy once,
+then enable its Windows tray updates. See [Player setup](docs/MODRINTH_UPDATER.md).
+The owner publishes through the separate **Jan's Pack Admin** UI; see [Admin panel](docs/ADMIN_PANEL.md).
+Players do not need the admin application, Git, Python or a GitHub account.
+
 **Windows:** download `jans-launcher-windows-x86_64.exe` from the
 [latest release](../../releases/latest), put it anywhere (e.g. Desktop) and double-click it.
 Windows SmartScreen may warn because the exe is not signed: *More info → Run anyway*.
