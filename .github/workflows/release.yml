@@ -20,11 +20,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: jans-launcher.exe
             asset: jans-launcher-windows-x86_64.exe
+            updater_bin: jans-modpack-updater.exe
+            updater_asset: jans-modpack-updater-windows-x86_64.exe
           # Oldest supported Ubuntu runner, so the binary works on older glibc distros too.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bin: jans-launcher
             asset: jans-launcher-linux-x86_64
+            updater_bin: jans-modpack-updater
+            updater_asset: jans-modpack-updater-linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +52,7 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.asset }}
+          cp target/${{ matrix.target }}/release/${{ matrix.updater_bin }} dist/${{ matrix.updater_asset }}
           if [ "${{ runner.os }}" = "Linux" ]; then
             mkdir -p pkg/jans-launcher
             cp target/${{ matrix.target }}/release/jans-launcher pkg/jans-launcher/

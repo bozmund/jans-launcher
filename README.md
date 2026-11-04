@@ -138,3 +138,10 @@ The public client ID is `ebddfc17-e502-4c3e-9d64-92711868988f`; it is not a clie
 review is pending and no authenticated end-to-end launch is claimed until the service accepts this app.
 
 NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
+
+## Update an existing Modrinth profile
+
+Download the separate **jans-modpack-updater** executable. It checks and applies Jan's published
+pack changes to your existing Fabric 26.3 profile while Modrinth continues to handle sign-in and
+Play. This works without waiting for Jan's Minecraft AppID approval. See
+[Modrinth updater instructions](docs/MODRINTH_UPDATER.md).

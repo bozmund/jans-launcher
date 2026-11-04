@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Jan's Modpack Updater
+Comment=Update Jan's Fabric 26.3 pack in your existing Modrinth profile
+Exec=jans-modpack-updater
+Icon=jans-launcher
+Terminal=false
+Categories=Game;
