@@ -77,9 +77,24 @@ pub fn identity(path: &Path) -> Result<String> {
         "SELECT i.id,c.source_kind FROM instances i JOIN instance_content_sets c ON c.id=i.applied_content_set_id WHERE i.path=?1",
         [relative.as_ref()], |r| Ok((r.get(0)?, r.get(1)?)))
         .context("Cannot verify independent profile identity")?;
+    if kind == "imported_modpack" {
+        let marker=crate::modrinth_setup::marker(&profile.directory).context("This imported profile was not created by Jan's launcher. Use Create Modrinth profile first")?;
+        let expected_filename = format!("{}.mrpack", marker.id);
+        let independent:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM instance_links l JOIN instances i ON i.id=l.instance_id WHERE l.instance_id=?1 AND l.link_kind='imported_modpack' AND l.imported_filename=?2 AND l.shared_instance_id IS NULL AND l.modrinth_project_id IS NULL AND l.content_project_id IS NULL AND l.server_project_id IS NULL AND l.hosting_server_id IS NULL AND i.install_stage='installed')",rusqlite::params![id,expected_filename],|r|r.get(0)).context("Cannot verify local migration profile")?;
+        ensure!(
+            independent,
+            "Wait for Modrinth installation to finish. This copy must have no shared/project update connection"
+        );
+        let remote_refs:i64=db.query_row("SELECT COUNT(*) FROM instance_content_set_remote_refs r JOIN instances i ON i.applied_content_set_id=r.content_set_id WHERE i.id=?1",[&id],|r|r.get(0))?;
+        ensure!(
+            remote_refs == 0,
+            "The migrated profile has a remote update association; automatic updates refused"
+        );
+        return Ok(id);
+    }
     ensure!(
         kind == "local",
-        "Automatic updates need the new local profile, not the old shared/imported modpack. Create a separate local Fabric 26.3 profile first."
+        "Automatic updates need the new local profile, not the old shared/imported modpack. Use Create Modrinth profile first."
     );
     let links: i64 = db.query_row("SELECT COUNT(*) FROM instance_links WHERE instance_id=?1 AND (link_kind IS NULL OR link_kind != 'unmanaged')", [&id], |r|r.get(0))
         .context("Cannot verify that this profile has no remote update association")?;
@@ -284,6 +299,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn accepts_only_our_completed_native_import_without_remote_links() {
+        let f = Fixture::new();
+        f.db().execute_batch("ALTER TABLE instances ADD COLUMN install_stage TEXT DEFAULT 'installed';ALTER TABLE instance_links ADD COLUMN imported_filename TEXT;ALTER TABLE instance_links ADD COLUMN shared_instance_id TEXT;ALTER TABLE instance_links ADD COLUMN modrinth_project_id TEXT;ALTER TABLE instance_links ADD COLUMN content_project_id TEXT;ALTER TABLE instance_links ADD COLUMN server_project_id TEXT;ALTER TABLE instance_links ADD COLUMN hosting_server_id TEXT;CREATE TABLE instance_content_set_remote_refs(content_set_id TEXT);UPDATE instance_content_sets SET source_kind='imported_modpack';INSERT INTO instance_links(instance_id,link_kind,imported_filename) VALUES('local:one','imported_modpack','jans-local-fixture.mrpack');").unwrap();
+        fs::create_dir_all(f.profile.join(".jans-launcher")).unwrap();
+        fs::write(
+            f.profile.join(crate::modrinth_setup::MARKER),
+            serde_json::to_vec(&crate::modrinth_setup::Marker {
+                format: 1,
+                channel: config::DEFAULT_PACK_SOURCE.into(),
+                id: "jans-local-fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        validate(&f.enrolled()).unwrap();
+        f.db()
+            .execute("UPDATE instances SET install_stage='not_installed'", [])
+            .unwrap();
+        assert!(validate(&f.enrolled()).is_err());
+        f.db()
+            .execute("UPDATE instances SET install_stage='installed'", [])
+            .unwrap();
+        f.db()
+            .execute(
+                "UPDATE instance_links SET shared_instance_id='old-link'",
+                [],
+            )
+            .unwrap();
+        assert!(validate(&f.enrolled()).is_err());
+        f.db()
+            .execute("UPDATE instance_links SET shared_instance_id=NULL", [])
+            .unwrap();
+        f.db()
+            .execute(
+                "INSERT INTO instance_content_set_remote_refs VALUES('set')",
+                [],
+            )
+            .unwrap();
+        assert!(validate(&f.enrolled()).is_err());
     }
     #[test]
     fn rejects_shared_linked_and_replaced_targets() {

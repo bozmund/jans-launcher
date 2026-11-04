@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 mod config;
 mod manifest;
+mod modrinth_setup;
 mod publish;
 mod source;
 mod sync;
@@ -126,6 +127,7 @@ enum Message {
     Checked(Result<sync::Changes>),
     Applied(Result<()>),
     Copied(Result<usize>),
+    NativeProfile(Result<Option<PathBuf>>),
 }
 struct App {
     runtime: tokio::runtime::Runtime,
@@ -250,6 +252,14 @@ impl App {
             match message {
                 Message::Profiles(Ok(profiles)) => {
                     self.profiles = profiles;
+                    let owned: Vec<_> = self
+                        .profiles
+                        .iter()
+                        .filter(|p| modrinth_setup::marker(&p.directory).is_some())
+                        .collect();
+                    if owned.len() == 1 {
+                        self.selected = Some(owned[0].directory.clone());
+                    }
                     if self
                         .selected
                         .as_ref()
@@ -289,10 +299,23 @@ impl App {
                 Message::Profiles(Err(e))
                 | Message::Checked(Err(e))
                 | Message::Applied(Err(e))
-                | Message::Copied(Err(e)) => {
+                | Message::Copied(Err(e))
+                | Message::NativeProfile(Err(e)) => {
                     self.error = Some(format!("{e:#}"));
                     self.status =
                         "Operation did not complete. Read the error below and retry.".into();
+                }
+                Message::NativeProfile(Ok(path)) => {
+                    match modrinth_setup::open_installer(path.as_deref()) {
+                        Ok(()) => {
+                            self.status = if path.is_some() {
+                                "Confirm Install in Modrinth, then Refresh here and select Jan's Fabric 26.3. Game settings and worlds are copied; the old profile is kept. Keep the local migration archive private.".into()
+                            } else {
+                                "Your independent profile already exists. Select it here for automatic updates.".into()
+                            }
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
                 }
             }
         }
@@ -312,6 +335,13 @@ impl eframe::App for App {
             });
             ui.add_space(12.0);
             ui.label(RichText::new("MODRINTH PROFILE").strong());
+            if ui.add_enabled(!self.busy,egui::Button::new("Create Modrinth profile").fill(Color32::from_rgb(27,125,79))).clicked(){
+                self.busy=true;self.error=None;self.status="Detecting your pack and preparing an independent copy…".into();
+                let client=self.client.clone();let send=self.sender();let state=self.progress.clone();let ctx=self.ctx.clone();
+                let progress:sync::ProgressFn=Arc::new(move|phase,done,total|{*state.lock().unwrap()=(phase.into(),done,total);ctx.request_repaint_after(std::time::Duration::from_millis(150));});
+                self.runtime.spawn(async move{send(Message::NativeProfile(modrinth_setup::prepare(&client,None,progress).await));});
+            }
+            ui.small("Detects your old Jan's pack and copies its game settings and worlds into an independent profile. Confirm Install in Modrinth; keep the old profile as backup.");
             let current=self.profiles.iter().find(|p|Some(&p.directory)==self.selected.as_ref()).map(|p|p.name.clone()).unwrap_or_else(||"Choose Fabric 26.3…".into());
             let mut chosen=None;
             ui.add_enabled_ui(!self.busy,|ui| {

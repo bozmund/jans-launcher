@@ -8,11 +8,13 @@ mod import;
 mod java;
 mod launch;
 mod manifest;
+mod modrinth_setup;
 mod publish;
 mod selfupdate;
 mod source;
 mod sync;
 mod transaction;
+mod updater_profiles;
 mod util;
 
 use anyhow::Result;
@@ -32,6 +34,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Detect existing copies of Jan's pack without changing them.
+    ModrinthProfiles,
+    /// Prepare a local native-import archive; never opens a window or edits Modrinth's database.
+    ExportModrinth {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        loader: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Inspect the mod catalog without opening the window.
     Mods {
         #[command(subcommand)]
@@ -225,6 +238,28 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Cmd::ModrinthProfiles => {
+            let fetched = source::PackSource::parse(config::DEFAULT_PACK_SOURCE)?
+                .fetch(&client)
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&modrinth_setup::matching(&fetched.manifest)?)?
+            );
+            Ok(())
+        }
+        Cmd::ExportModrinth {
+            profile,
+            loader,
+            output,
+        } => {
+            let path = modrinth_setup::export(&profile, &loader, &output, Arc::new(|_, _, _| {}))?;
+            println!(
+                "{}",
+                serde_json::json!({"archive":path,"original_preserved":true,"confirmation":"Install through Modrinth"})
+            );
             Ok(())
         }
         Cmd::Publish {

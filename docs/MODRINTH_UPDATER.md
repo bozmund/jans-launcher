@@ -8,19 +8,29 @@ Minecraft authentication, runtime installation and starting the game.
 ## Players
 
 1. Save and close Minecraft. Keep the old shared Fabric 26.3 profile as a backup.
-2. Once, create a **new local Fabric 26.3 profile** in Modrinth with the same Fabric loader as the
-   old profile. Do not import or duplicate the shared pack: this could inherit its update link.
-   Modrinth currently exposes no supported external profile-creation API, so this native step
-   stays in Modrinth rather than rewriting its private database.
-3. Open **Jan's Modpack Updater**. Under **One-time setup**, select the old profile as the source,
-   then select the new empty profile as the destination and click **Copy everything**. The copy
-   includes mods, worlds, configs, settings, screenshots and personal files; operational updater
-   caches/locks are not copied. Symlinks/junctions are refused with a concrete path. The source
-   remains intact; a destination containing worlds/mods/screenshots is refused. Use a fresh target.
-4. Select the new profile. If automatic discovery does not find a
+2. Click **Create Modrinth profile** in Jan's Launcher or Jan's Modpack Updater. It detects the
+   existing Jan's pack by its old shared ID, updater state or a strong match of stable mod identities,
+   rather than trusting the profile name. If several copies match, choose which one contains your
+   settings/worlds. If no copy exists, it downloads the published pack first.
+3. Confirm **Install** in Modrinth's native installer. The button builds and opens a supported local
+   `.mrpack`; no empty-profile creation or manual copying is needed. Game settings, configs, worlds,
+   mods and personal files are copied byte-for-byte. Old updater metadata and the shared-instance
+   link are not carried across. Modrinth's own account, global settings and runtime preferences remain
+   managed by Modrinth; its private database is not rewritten by our application.
+4. Click **Refresh** in the updater. A single detected independent copy is selected automatically.
+   If automatic discovery does not find a
    custom Modrinth data directory, use **Browse** and choose its `profiles/Fabric 26.3` folder.
 5. Click **Check for updates**, review the pack version and download size, then **Update profile**.
 6. Wait for **Up to date**, click **Open Modrinth**, and play the new profile in Modrinth.
+
+Migration archives are stored locally under the app's `modrinth-imports/` folder. They can be large
+because they include player worlds. **Do not share/upload these personal archives.** They are separate
+from the public pack publisher. Unsafe symlinks/junctions are refused with a path. The source is checked
+again after copying; a changing source causes failure rather than an inconsistent world copy.
+
+Creating the independent profile stops native shared-instance updates. Jan's background updater
+still intentionally manages its pack files; existing configs remain copy-only-if-missing.
+The previous manual empty-local-profile/copy workflow remains under advanced one-time setup.
 
 ## Automatic updates on Windows
 
@@ -38,7 +48,9 @@ continuous integrity scan; use the manual Check button to diagnose locally chang
 Right-click the tray icon for **Open updater / status**, **Check now**, or **Exit after current
 update**. Exit stops this run; **Disable automatic updates** in the window also removes login
 startup. An update already installing finishes safely before exit. Other profiles are not enrolled
-implicitly. The worker verifies the enrolled profile ID and refuses shared/imported/linked profiles
+implicitly. The worker verifies the enrolled profile ID and refuses shared/linked profiles and
+arbitrary imported modpacks. Only our marked, fully installed local migration import is also accepted,
+with its matching local filename and no remote references. It also refuses
 or a replacement at the same folder path. A loader change requires changing the loader in Modrinth.
 
 Settings and the last check/update/error are kept in the updater's user-data directory as

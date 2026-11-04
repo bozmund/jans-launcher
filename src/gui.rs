@@ -75,6 +75,7 @@ enum Msg {
     ModUpdates(Result<Vec<catalog::AvailableUpdate>>),
     ModPlan(Result<catalog::InstallPlan>),
     ModInstalled(Result<()>),
+    ModrinthProfile(Result<Option<PathBuf>>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -97,6 +98,7 @@ enum Busy {
     SelfUpdating,
     Catalog,
     InstallingMod,
+    ModrinthProfile,
 }
 
 struct App {
@@ -389,6 +391,22 @@ impl App {
                     Err(e) => self.fail("Mod installation", e),
                 }
             }
+            Msg::ModrinthProfile(result) => {
+                self.busy = None;
+                match result {
+                    Ok(path) => match crate::modrinth_setup::open_installer(path.as_deref()) {
+                        Ok(()) => {
+                            self.status = if path.is_some() {
+                                "Confirm Install in Modrinth. Your game settings, mods and worlds are copied; the old profile is kept. Keep the migration archive private.".into()
+                            } else {
+                                "Your independent profile already exists. Open it in Modrinth to play.".into()
+                            }
+                        }
+                        Err(e) => self.fail("Open Modrinth installer", e),
+                    },
+                    Err(e) => self.fail("Create Modrinth profile", e),
+                }
+            }
             Msg::Changes(r) => {
                 self.busy = None;
                 match r {
@@ -549,11 +567,12 @@ impl App {
                 Busy::SelfUpdating => "Updating launcher…",
                 Busy::Catalog => "Fetching mods…",
                 Busy::InstallingMod => "Installing mods…",
+                Busy::ModrinthProfile => "Preparing your Modrinth profile…",
             };
             let p = self.progress.lock().unwrap().clone();
             match (busy, p) {
                 (
-                    Busy::Updating | Busy::Launching | Busy::InstallingMod,
+                    Busy::Updating | Busy::Launching | Busy::InstallingMod | Busy::ModrinthProfile,
                     Some((what, done, total)),
                 ) if total > 0 => {
                     let what = match what.as_str() {
@@ -676,6 +695,32 @@ impl App {
                     );
                 }
             });
+        ui.add_space(12.0);
+        ui.label("Play through Modrinth while standalone sign-in approval is pending.");
+        if ui
+            .add_enabled(
+                idle,
+                egui::Button::new("Create Modrinth profile").min_size(egui::vec2(220.0, 44.0)),
+            )
+            .clicked()
+        {
+            self.busy = Some(Busy::ModrinthProfile);
+            self.error = None;
+            let client = self.client.clone();
+            let send = self.sender();
+            let state = self.progress.clone();
+            let ctx = self.ctx.clone();
+            let progress: ProgressFn = Arc::new(move |phase, done, total| {
+                *state.lock().unwrap() = Some((phase.into(), done, total));
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            });
+            self.rt.spawn(async move {
+                send(Msg::ModrinthProfile(
+                    crate::modrinth_setup::prepare(&client, None, progress).await,
+                ));
+            });
+        }
+        ui.small("Detects your Jan's pack and copies its game settings, mods and worlds into an independent profile. Your old profile stays intact. Confirm installation in Modrinth.");
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             let count = self

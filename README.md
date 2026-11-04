@@ -54,6 +54,12 @@ then enable its Windows tray updates. See [Player setup](docs/MODRINTH_UPDATER.m
 The owner publishes through the separate **Jan's Pack Admin** UI; see [Admin panel](docs/ADMIN_PANEL.md).
 Players do not need the admin application, Git, Python or a GitHub account.
 
+**Create Modrinth profile** in the launcher or updater detects an existing copy of Jan's pack and
+prepares an independent native import with the player's game settings and worlds preserved. Confirm
+Install in Modrinth. The original profile remains as a backup; the new copy uses Jan's updater instead
+of the old shared-instance update link. Local migration archives contain personal files and should
+not be shared. This route uses Modrinth's existing Minecraft sign-in while standalone approval is pending.
+
 **Windows:** download `jans-launcher-windows-x86_64.exe` from the
 [latest release](../../releases/latest), put it anywhere (e.g. Desktop) and double-click it.
 Windows SmartScreen may warn because the exe is not signed: *More info → Run anyway*.
