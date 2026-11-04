@@ -130,6 +130,11 @@ enum Message {
     NativeProfile(Result<Option<PathBuf>>),
 }
 struct App {
+    close_to_tray: bool,
+    resident_started: bool,
+    setup_archive: Option<PathBuf>,
+    setup_started: Option<std::time::Instant>,
+    setup_handoff: Option<std::time::Instant>,
     runtime: tokio::runtime::Runtime,
     client: reqwest::Client,
     tx: Sender<Message>,
@@ -163,6 +168,11 @@ impl App {
                 .and_then(|b| serde_json::from_slice(&b).ok())
         });
         let mut app = Self {
+            close_to_tray: false,
+            resident_started: false,
+            setup_archive: modrinth_setup::pending_archive(),
+            setup_started: None,
+            setup_handoff: None,
             runtime: tokio::runtime::Runtime::new().unwrap(),
             client: util::http(),
             tx,
@@ -301,11 +311,15 @@ impl App {
                 | Message::Applied(Err(e))
                 | Message::Copied(Err(e))
                 | Message::NativeProfile(Err(e)) => {
+                    self.setup_started = None;
                     self.error = Some(format!("{e:#}"));
                     self.status =
                         "Operation did not complete. Read the error below and retry.".into();
                 }
                 Message::NativeProfile(Ok(path)) => {
+                    self.setup_started = None;
+                    self.setup_archive = path.clone();
+                    self.setup_handoff = Some(std::time::Instant::now());
                     match modrinth_setup::open_installer(path.as_deref()) {
                         Ok(()) => {
                             self.status = if path.is_some() {
@@ -325,8 +339,16 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.messages();
+        updater_background::handle_close(
+            ui,
+            self.busy || self.setup_started.is_some(),
+            &mut self.close_to_tray,
+            &mut self.resident_started,
+            &mut self.error,
+        );
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(23,25,29)).inner_margin(24)).show(ui,|ui| {
             ui.heading(RichText::new("Jan's Modpack Updater").size(28.0));
+            ui.small("Close this window to keep updating in the Windows tray. Use Exit from the tray menu to stop the app.");
             ui.label("Update your existing Fabric 26.3 profile. Keep playing through Modrinth.");
             ui.add_space(12.0);
             egui::Frame::new().fill(Color32::from_rgb(30,44,37)).corner_radius(10).inner_margin(16).show(ui,|ui| {
@@ -335,12 +357,22 @@ impl eframe::App for App {
             });
             ui.add_space(12.0);
             ui.label(RichText::new("MODRINTH PROFILE").strong());
-            if ui.add_enabled(!self.busy,egui::Button::new("Create Modrinth profile").fill(Color32::from_rgb(27,125,79))).clicked(){
+            let cooldown=self.setup_handoff.is_some_and(|t|t.elapsed()<std::time::Duration::from_secs(2));
+            if ui.add_enabled(!self.busy&&self.setup_started.is_none()&&!cooldown,egui::Button::new(if self.setup_started.is_some(){"Preparing profile—please wait…"}else if self.setup_archive.is_some(){"Continue installation in Modrinth"}else{"Create Modrinth profile"}).fill(Color32::from_rgb(27,125,79))).clicked(){
+                if let Some(path)=&self.setup_archive{
+                    self.setup_handoff=Some(std::time::Instant::now());
+                    if let Err(e)=modrinth_setup::open_installer(Some(path)){self.error=Some(format!("{e:#}"));}
+                }else{
                 self.busy=true;self.error=None;self.status="Detecting your pack and preparing an independent copy…".into();
+                self.setup_started=Some(std::time::Instant::now());*self.progress.lock().unwrap()=("Starting profile setup…".into(),0,0);
                 let client=self.client.clone();let send=self.sender();let state=self.progress.clone();let ctx=self.ctx.clone();
                 let progress:sync::ProgressFn=Arc::new(move|phase,done,total|{*state.lock().unwrap()=(phase.into(),done,total);ctx.request_repaint_after(std::time::Duration::from_millis(150));});
                 self.runtime.spawn(async move{send(Message::NativeProfile(modrinth_setup::prepare(&client,None,progress).await));});
+                }
             }
+            if cooldown{ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));}
+            if let Some(started)=self.setup_started{let(stage,done,total)=self.progress.lock().unwrap().clone();modrinth_setup::setup_progress(ui,&stage,done,total,started.elapsed());}
+            else if self.setup_archive.is_some(){ui.colored_label(Color32::YELLOW,"Your copy is ready. Confirm Install in Modrinth and wait there. Continue reopens this same copy instead of creating a second one.");}
             ui.small("Detects your old Jan's pack and copies its game settings and worlds into an independent profile. Confirm Install in Modrinth; keep the old profile as backup.");
             let current=self.profiles.iter().find(|p|Some(&p.directory)==self.selected.as_ref()).map(|p|p.name.clone()).unwrap_or_else(||"Choose Fabric 26.3…".into());
             let mut chosen=None;

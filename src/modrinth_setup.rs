@@ -16,6 +16,123 @@ use std::{
 };
 const LEGACY_SHARED_ID: &str = "NKvb031t";
 pub const MARKER: &str = ".jans-launcher/modrinth-import.json";
+pub struct SetupLease(fs::File);
+impl SetupLease {
+    pub fn acquire(directory: &Path) -> Result<Self> {
+        fs::create_dir_all(directory)?;
+        let file = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("modrinth-setup.lock"))?;
+        file.try_lock().context(
+            "Profile setup is already running in another window. Wait for that operation to finish",
+        )?;
+        Ok(Self(file))
+    }
+}
+impl Drop for SetupLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingArchive {
+    source: PathBuf,
+    loader: String,
+    archive: PathBuf,
+    size: u64,
+    modified: u128,
+}
+fn archive_stamp(path: &Path) -> Result<(u64, u128)> {
+    let m = fs::metadata(path)?;
+    Ok((
+        m.len(),
+        m.modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos(),
+    ))
+}
+fn pending_in(output: &Path) -> Option<PendingArchive> {
+    let p: PendingArchive =
+        serde_json::from_slice(&fs::read(output.join("pending.json")).ok()?).ok()?;
+    let output = fs::canonicalize(output).ok()?;
+    let archive = fs::canonicalize(&p.archive).ok()?;
+    if archive.parent() != Some(output.as_path())
+        || archive.extension()?.to_str()? != "mrpack"
+        || archive_stamp(&archive).ok()? != (p.size, p.modified)
+    {
+        return None;
+    }
+    let mut zip = zip::ZipArchive::new(fs::File::open(&archive).ok()?).ok()?;
+    let index: serde_json::Value =
+        serde_json::from_reader(zip.by_name("modrinth.index.json").ok()?).ok()?;
+    if index["name"] != "Jan's Fabric 26.3" {
+        return None;
+    }
+    Some(p)
+}
+pub fn pending_archive() -> Option<PathBuf> {
+    pending_in(&config::data_dir().join("modrinth-imports")).map(|p| p.archive)
+}
+pub fn completed_archive(archive: &Path) -> bool {
+    let Some(id) = archive.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    updater_profiles::discover().ok().is_some_and(|profiles| {
+        profiles.iter().any(|p| {
+            marker(&p.directory).is_some_and(|m| m.id == id) && ensure_import_complete(p).is_ok()
+        })
+    })
+}
+
+pub fn setup_progress(
+    ui: &mut eframe::egui::Ui,
+    stage: &str,
+    done: u64,
+    total: u64,
+    elapsed: std::time::Duration,
+) {
+    use eframe::egui::{self, Color32, RichText};
+    egui::Frame::new()
+        .fill(Color32::from_rgb(34, 46, 58))
+        .corner_radius(8)
+        .inner_margin(12)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(if stage.is_empty() {
+                        "Starting profile setup…"
+                    } else {
+                        stage
+                    })
+                    .strong(),
+                );
+            });
+            ui.label("Please wait. Keep this window open; you do not need to click again.");
+            if total > 0 {
+                ui.add(
+                    egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
+                        .show_percentage()
+                        .text(format!(
+                            "{} / {}",
+                            util::human_bytes(done),
+                            util::human_bytes(total)
+                        )),
+                );
+            }
+            ui.small(format!(
+                "Elapsed: {}m {:02}s",
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60
+            ));
+        });
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(150));
+}
 #[derive(Serialize, Deserialize)]
 pub struct Marker {
     pub format: u32,
@@ -122,7 +239,18 @@ fn ensure_import_complete(profile: &updater_profiles::Profile) -> Result<()> {
     Ok(())
 }
 fn inventory(root: &Path) -> Result<BTreeMap<String, (u64, String)>> {
+    let progress: sync::ProgressFn = std::sync::Arc::new(|_, _, _| {});
+    inventory_progress(root, "Checking profile files", &progress)
+}
+fn inventory_progress(
+    root: &Path,
+    stage: &str,
+    progress: &sync::ProgressFn,
+) -> Result<BTreeMap<String, (u64, String)>> {
     let mut files = BTreeMap::new();
+    let mut paths = Vec::new();
+    let mut total = 0;
+    progress(stage, 0, 0);
     for e in walkdir::WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -145,7 +273,9 @@ fn inventory(root: &Path) -> Result<BTreeMap<String, (u64, String)>> {
             path.display()
         );
         if e.file_type().is_file() {
-            files.insert(rel, (e.metadata()?.len(), util::sha512_file(&path)?));
+            let size = e.metadata()?.len();
+            total += size;
+            paths.push((rel, path, size));
         } else {
             ensure!(
                 e.file_type().is_dir(),
@@ -153,6 +283,22 @@ fn inventory(root: &Path) -> Result<BTreeMap<String, (u64, String)>> {
                 path.display()
             );
         }
+    }
+    let mut done = 0;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for (relative, path, size) in paths {
+        let mut file = fs::File::open(&path)?;
+        let mut hash = Sha512::new();
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+            done += n as u64;
+            progress(stage, done, total);
+        }
+        files.insert(relative, (size, hex::encode(hash.finalize())));
     }
     Ok(files)
 }
@@ -170,15 +316,30 @@ pub fn export(
         !output.starts_with(&root),
         "Migration archives must be outside the source profile"
     );
+    let _export = SetupLease::acquire(&output)?;
     let _lock = transaction::InstanceLock::acquire(&root)?;
     transaction::ensure_game_stopped(&root)?;
+    if let Some(pending) = pending_in(&output) {
+        if pending.source == root && pending.loader == loader {
+            progress(
+                "Your copy is already prepared. Reopening the same Modrinth installer…",
+                0,
+                0,
+            );
+            return Ok(pending.archive);
+        }
+    }
     ensure!(
         !root
             .join(".jans-launcher/transaction/journal.json")
             .exists(),
         "Finish the source profile's interrupted update before copying it"
     );
-    let files = inventory(&root)?;
+    let files = inventory_progress(
+        &root,
+        "Checking your existing mods, settings and worlds",
+        &progress,
+    )?;
     let total = files.values().map(|x| x.0).sum();
     let id = format!(
         "jans-local-{}-{}",
@@ -214,7 +375,7 @@ pub fn export(
                 digest.update(&buffer[..n]);
                 copied += n as u64;
                 done += n as u64;
-                progress("Preparing Modrinth profile", done, total);
+                progress("Copying your mods, settings and worlds", done, total);
             }
             ensure!(
                 copied == *size && hex::encode(digest.finalize()) == *hash,
@@ -227,13 +388,30 @@ pub fn export(
             channel: config::DEFAULT_PACK_SOURCE.into(),
             id: id.clone(),
         })?)?;
+        progress("Saving the prepared copy to disk", 0, 0);
         zip.finish()?.sync_all()?;
         ensure!(
-            inventory(&root)? == files,
+            inventory_progress(
+                &root,
+                "Verifying that your original files are unchanged",
+                &progress
+            )? == files,
             "The old profile changed during export; retry after closing Minecraft"
         );
         transaction::ensure_game_stopped(&root)?;
         fs::rename(&partial, &path)?;
+        let (size, modified) = archive_stamp(&path)?;
+        util::write_atomic(
+            &output.join("pending.json"),
+            &serde_json::to_vec(&PendingArchive {
+                source: root.clone(),
+                loader: loader.into(),
+                archive: path.clone(),
+                size,
+                modified,
+            })?,
+        )?;
+        progress("Copy ready. Opening Modrinth—confirm Install there", 0, 0);
         Ok(())
     })();
     if let Err(e) = result {
@@ -249,6 +427,8 @@ pub async fn prepare(
     explicit: Option<PathBuf>,
     progress: sync::ProgressFn,
 ) -> Result<Option<PathBuf>> {
+    let _setup = SetupLease::acquire(&config::data_dir())?;
+    progress("Checking the published pack version", 0, 0);
     let fetched = source::PackSource::parse(config::DEFAULT_PACK_SOURCE)?
         .fetch(client)
         .await?;
@@ -264,6 +444,7 @@ pub async fn prepare(
         }
         (p.directory, p.loader_version)
     } else {
+        progress("Looking for your existing Jan's pack", 0, 0);
         let pack = fetched.manifest.clone();
         let matches = tokio::task::spawn_blocking(move || matching(&pack)).await??;
         if let Some(existing) = matches.iter().find(|p| marker(&p.directory).is_some()) {
@@ -282,6 +463,7 @@ pub async fn prepare(
                     .context("Choose one of the detected Jan's pack profiles")?,
             )
         } else {
+            progress("No existing copy found. Preparing the pack download", 0, 0);
             None
         };
         if let Some(p) = selected {
@@ -303,6 +485,9 @@ pub async fn prepare(
 }
 
 pub fn open_installer(archive: Option<&Path>) -> Result<()> {
+    if archive.is_some_and(completed_archive) {
+        return open::that("modrinth://").context("Cannot open the installed Modrinth profile");
+    }
     let Some(archive) = archive else {
         return open::that("modrinth://").context("Cannot open Modrinth");
     };
@@ -348,6 +533,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     #[test]
+    fn only_one_setup_window_can_prepare_a_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "jans-setup-lock-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let lock = SetupLease::acquire(&root).unwrap();
+        assert!(SetupLease::acquire(&root).is_err());
+        drop(lock);
+        drop(SetupLease::acquire(&root).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn migration_archive_preserves_worlds_settings_and_mods_without_shared_metadata() {
         let root = std::env::temp_dir().join(format!(
             "jans-native-{}-{}",
@@ -369,13 +567,48 @@ mod tests {
         )
         .unwrap();
         let before = inventory(&source).unwrap();
+        let stages = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = stages.clone();
         let path = export(
+            &source,
+            "0.20.1",
+            &root.join("archives"),
+            Arc::new(move |phase, _, _| {
+                let mut phases = recorded.lock().unwrap();
+                if phases.last().map(String::as_str) != Some(phase) {
+                    phases.push(phase.into());
+                }
+            }),
+        )
+        .unwrap();
+        let second = export(
             &source,
             "0.20.1",
             &root.join("archives"),
             Arc::new(|_, _, _| {}),
         )
         .unwrap();
+        assert_eq!(
+            path, second,
+            "a second click must reuse the prepared archive"
+        );
+        assert_eq!(
+            fs::read_dir(root.join("archives"))
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "mrpack"))
+                .count(),
+            1
+        );
+        let phases = stages.lock().unwrap();
+        assert!(phases.iter().any(|s| s.starts_with("Checking")));
+        assert!(phases.iter().any(|s| s.starts_with("Copying")));
+        assert!(phases.iter().any(|s| s.starts_with("Verifying")));
+        drop(phases);
         let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
         let index: serde_json::Value =
             serde_json::from_reader(zip.by_name("modrinth.index.json").unwrap()).unwrap();

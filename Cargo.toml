@@ -1,6 +1,6 @@
 [package]
 name = "jans-launcher"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 default-run = "jans-launcher"
 description = "One-click modpack updater and Minecraft launcher for Jan's Fabric pack"

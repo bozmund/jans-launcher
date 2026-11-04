@@ -102,6 +102,11 @@ enum Busy {
 }
 
 struct App {
+    close_to_tray: bool,
+    resident_started: bool,
+    setup_archive: Option<PathBuf>,
+    setup_started: Option<std::time::Instant>,
+    setup_handoff: Option<std::time::Instant>,
     settings: Settings,
     rt: tokio::runtime::Runtime,
     client: reqwest::Client,
@@ -154,6 +159,11 @@ impl App {
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
         let (tx, rx) = channel();
         let mut app = App {
+            close_to_tray: false,
+            resident_started: false,
+            setup_archive: crate::modrinth_setup::pending_archive(),
+            setup_started: None,
+            setup_handoff: None,
             settings: Settings::load().single_pack(),
             rt: tokio::runtime::Runtime::new().expect("tokio"),
             client: util::http(),
@@ -393,17 +403,22 @@ impl App {
             }
             Msg::ModrinthProfile(result) => {
                 self.busy = None;
+                self.setup_started = None;
                 match result {
-                    Ok(path) => match crate::modrinth_setup::open_installer(path.as_deref()) {
-                        Ok(()) => {
-                            self.status = if path.is_some() {
-                                "Confirm Install in Modrinth. Your game settings, mods and worlds are copied; the old profile is kept. Keep the migration archive private.".into()
-                            } else {
-                                "Your independent profile already exists. Open it in Modrinth to play.".into()
+                    Ok(path) => {
+                        self.setup_archive = path.clone();
+                        self.setup_handoff = Some(std::time::Instant::now());
+                        match crate::modrinth_setup::open_installer(path.as_deref()) {
+                            Ok(()) => {
+                                self.status = if path.is_some() {
+                                    "Confirm Install in Modrinth. Your game settings, mods and worlds are copied; the old profile is kept. Keep the migration archive private.".into()
+                                } else {
+                                    "Your independent profile already exists. Open it in Modrinth to play.".into()
+                                }
                             }
+                            Err(e) => self.fail("Open Modrinth installer", e),
                         }
-                        Err(e) => self.fail("Open Modrinth installer", e),
-                    },
+                    }
                     Err(e) => self.fail("Create Modrinth profile", e),
                 }
             }
@@ -697,30 +712,72 @@ impl App {
             });
         ui.add_space(12.0);
         ui.label("Play through Modrinth while standalone sign-in approval is pending.");
+        let cooldown = self
+            .setup_handoff
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
         if ui
             .add_enabled(
-                idle,
-                egui::Button::new("Create Modrinth profile").min_size(egui::vec2(220.0, 44.0)),
+                idle && self.setup_started.is_none() && !cooldown,
+                egui::Button::new(if self.busy == Some(Busy::ModrinthProfile) {
+                    "Preparing profile—please wait…"
+                } else if self.setup_archive.is_some() {
+                    "Continue installation in Modrinth"
+                } else {
+                    "Create Modrinth profile"
+                })
+                .min_size(egui::vec2(220.0, 44.0)),
             )
             .clicked()
         {
-            self.busy = Some(Busy::ModrinthProfile);
-            self.error = None;
-            let client = self.client.clone();
-            let send = self.sender();
-            let state = self.progress.clone();
-            let ctx = self.ctx.clone();
-            let progress: ProgressFn = Arc::new(move |phase, done, total| {
-                *state.lock().unwrap() = Some((phase.into(), done, total));
-                ctx.request_repaint_after(std::time::Duration::from_millis(150));
-            });
-            self.rt.spawn(async move {
-                send(Msg::ModrinthProfile(
-                    crate::modrinth_setup::prepare(&client, None, progress).await,
-                ));
-            });
+            if let Some(path) = &self.setup_archive {
+                self.setup_handoff = Some(std::time::Instant::now());
+                if let Err(e) = crate::modrinth_setup::open_installer(Some(path)) {
+                    self.fail("Open pending installer", e);
+                }
+            } else {
+                self.busy = Some(Busy::ModrinthProfile);
+                self.setup_started = Some(std::time::Instant::now());
+                self.error = None;
+                *self.progress.lock().unwrap() = Some(("Starting profile setup…".into(), 0, 0));
+                let client = self.client.clone();
+                let send = self.sender();
+                let state = self.progress.clone();
+                let ctx = self.ctx.clone();
+                let progress: ProgressFn = Arc::new(move |phase, done, total| {
+                    *state.lock().unwrap() = Some((phase.into(), done, total));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                });
+                self.rt.spawn(async move {
+                    send(Msg::ModrinthProfile(
+                        crate::modrinth_setup::prepare(&client, None, progress).await,
+                    ));
+                });
+            }
+        }
+        if cooldown {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if let Some(started) = self.setup_started {
+            let (stage, done, total) = self.progress.lock().unwrap().clone().unwrap_or_default();
+            crate::modrinth_setup::setup_progress(ui, &stage, done, total, started.elapsed());
+        } else if self.setup_archive.is_some() {
+            ui.colored_label(AMBER,"Your copy is prepared. In Modrinth, confirm Install and wait for installation to finish. Continue reopens the same copy; it does not create another one.");
         }
         ui.small("Detects your Jan's pack and copies its game settings, mods and worlds into an independent profile. Your old profile stays intact. Confirm installation in Modrinth.");
+        if cfg!(windows) {
+            ui.small("Closing this window keeps Jan's updater in the Windows tray. Right-click its icon and choose Exit to stop it.");
+        }
+        if let Some(s) = crate::updater_background::status() {
+            ui.label(format!("Tray updater: {}", s.message));
+        }
+        ui.horizontal(|ui|{
+            if ui.add_enabled(idle,egui::Button::new("Enable background updates")).clicked(){
+                let result=(||->Result<()>{let profiles:Vec<_>=crate::updater_profiles::discover()?.into_iter().filter(|p|crate::modrinth_setup::marker(&p.directory).is_some()).collect();anyhow::ensure!(profiles.len()==1,"Finish installation in Modrinth, then choose your profile in the companion updater");crate::updater_background::enable(&profiles[0].directory)})();
+                if let Err(e)=result{self.fail("Background updates",e);}
+            }
+            if ui.add_enabled(idle,egui::Button::new("Pause automatic updates")).clicked(){if let Err(e)=crate::updater_background::disable(){self.fail("Pause updates",e);}}
+        });
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             let count = self
@@ -994,6 +1051,13 @@ impl eframe::App for App {
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
+        crate::updater_background::handle_close(
+            ui,
+            self.busy.is_some() || self.setup_started.is_some(),
+            &mut self.close_to_tray,
+            &mut self.resident_started,
+            &mut self.error,
+        );
         // Settings that change where/what we sync need a fresh check once the user is done editing.
         if self.settings_dirty && self.tab == Tab::Home && self.busy.is_none() {
             self.settings_dirty = false;

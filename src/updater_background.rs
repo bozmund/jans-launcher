@@ -15,6 +15,7 @@ use std::{
 pub const INTERVAL: Duration = Duration::from_secs(300);
 pub static CHECK_NOW: AtomicBool = AtomicBool::new(false);
 pub static EXIT: AtomicBool = AtomicBool::new(false);
+static TRAY_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Enrollment {
@@ -53,6 +54,61 @@ fn now() -> String {
 }
 fn save_status(state: &Status) -> Result<()> {
     util::write_atomic(&status_path(), &serde_json::to_vec_pretty(state)?)
+}
+pub fn request_exit() -> Result<()> {
+    util::write_atomic(&config::data_dir().join("background-exit"), b"exit")
+}
+pub fn start_resident() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let exe = installed_exe()?;
+        fs::create_dir_all(exe.parent().unwrap())?;
+        let current = std::env::current_exe()?;
+        if fs::canonicalize(&exe).ok() != Some(fs::canonicalize(&current)?) {
+            if !exe.exists() {
+                fs::copy(&current, &exe)?;
+            }
+        }
+        if enrollment()?.is_none_or(|e| e.enabled) {
+            startup(true, &exe)?;
+        }
+        // Versioned filenames avoid overwriting a running executable.
+        spawn_worker(&exe)?;
+    }
+    Ok(())
+}
+/// Handle the window X without throwing away an active setup/download.
+pub fn handle_close(
+    ui: &mut eframe::egui::Ui,
+    busy: bool,
+    hiding: &mut bool,
+    resident: &mut bool,
+    error: &mut Option<String>,
+) {
+    #[cfg(windows)]
+    {
+        use eframe::egui::ViewportCommand;
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !*hiding {
+            if !*resident {
+                match start_resident() {
+                    Ok(()) => *resident = true,
+                    Err(e) => {
+                        *error = Some(format!("Could not start the tray updater: {e:#}"));
+                        ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
+                        return;
+                    }
+                }
+            }
+            if busy {
+                *hiding = true;
+                ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
+                ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+        }
+        if *hiding && !busy {
+            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
 }
 
 /// A path alone is insufficient: Modrinth may replace an instance at the same path.
@@ -159,7 +215,10 @@ fn installed_exe() -> Result<PathBuf> {
     Ok(directories::BaseDirs::new()
         .context("Missing user data folder")?
         .data_local_dir()
-        .join("Jan's Modpack Updater/jans-modpack-updater.exe"))
+        .join(format!(
+            "Jan's Modpack Updater/{}/jans-modpack-updater.exe",
+            env!("CARGO_PKG_VERSION")
+        )))
 }
 #[cfg(windows)]
 fn spawn_worker(exe: &Path) -> Result<()> {
@@ -425,21 +484,11 @@ pub fn run() -> Result<()> {
     if lock.try_lock().is_err() {
         return Ok(());
     }
-    let Some(e) = enrollment()? else {
-        return Ok(());
-    };
-    if !e.enabled {
-        return Ok(());
-    }
     #[cfg(windows)]
     std::thread::spawn(|| {
         if let Err(err) = crate::updater_tray::run() {
+            *TRAY_ERROR.lock().unwrap() = Some(format!("Tray unavailable: {err:#}"));
             EXIT.store(true, Ordering::Release);
-            let _ = save_status(&Status {
-                phase: "error".into(),
-                message: format!("Tray unavailable: {err:#}"),
-                ..Default::default()
-            });
         }
     });
     let rt = tokio::runtime::Runtime::new()?;
@@ -448,9 +497,47 @@ pub fn run() -> Result<()> {
     let mut state = status().unwrap_or_default();
     let mut due = Instant::now();
     while !EXIT.load(Ordering::Acquire) {
-        let Some(e) = enrollment()? else { break };
-        if !e.enabled {
+        if config::data_dir().join("background-exit").exists() {
+            fs::remove_file(config::data_dir().join("background-exit"))?;
             break;
+        }
+        let mut enrolled = enrollment()?;
+        if enrolled.is_none() && Instant::now() >= due {
+            let owned: Vec<_> = updater_profiles::discover()?
+                .into_iter()
+                .filter(|p| crate::modrinth_setup::marker(&p.directory).is_some())
+                .filter_map(|p| {
+                    identity(&p.directory).ok().map(|id| Enrollment {
+                        enabled: true,
+                        profile: p.directory,
+                        instance_id: id,
+                    })
+                })
+                .collect();
+            if owned.len() == 1 {
+                let e = owned.into_iter().next().unwrap();
+                util::write_atomic(&enrollment_path(), &serde_json::to_vec(&e)?)?;
+                enrolled = Some(e);
+            } else {
+                state.phase = "setup".into();
+                state.message="Waiting for your independent profile. Finish installation in Modrinth; then updates start automatically.".into();
+                save_status(&state)?;
+                due = Instant::now() + Duration::from_secs(10);
+            }
+        }
+        let Some(e) = enrolled else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if !e.enabled {
+            if state.phase != "paused" {
+                state.phase = "paused".into();
+                state.message =
+                    "Automatic updates are paused. Open the updater to enable them.".into();
+                save_status(&state)?;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
         }
         if CHECK_NOW.swap(false, Ordering::AcqRel) || Instant::now() >= due {
             state.phase = "checking".into();
@@ -470,8 +557,13 @@ pub fn run() -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    state.phase = "stopped".into();
-    state.message = "Background updater stopped".into();
+    if let Some(error) = TRAY_ERROR.lock().unwrap().take() {
+        state.phase = "error".into();
+        state.message = error;
+    } else {
+        state.phase = "stopped".into();
+        state.message = "Background updater stopped".into();
+    }
     save_status(&state)?;
     Ok(())
 }

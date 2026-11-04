@@ -34,7 +34,23 @@ The previous manual empty-local-profile/copy workflow remains under advanced one
 
 ## Automatic updates on Windows
 
-After selecting the independent local profile, click **Enable automatic updates at login** once.
+Closing either player window now keeps one lightweight worker in the Windows notification area.
+While setup is running, the window hides and the work continues; after completion its renderer closes.
+The tray worker can wait without a profile while native Modrinth installation finishes. It automatically
+enrolls exactly one completed marked independent copy. Explicitly paused updates remain paused.
+Use **Exit after current update** in the tray to stop the app, rather than the window X.
+
+The player apps share the same worker lock. The hidden worker needs no settings window/graphics
+context. Windows startup uses a versioned copy of the executable, so an updated app does not overwrite
+an executable currently in use. If an older worker is already present, its single-worker lock still wins;
+exit that older tray instance before starting the new version if its old UI remains visible.
+
+Setup progress appears beside **Create Modrinth profile**, including file checks, copying, verification
+and elapsed time. Once the archive is ready, the button changes to **Continue installation in Modrinth**.
+Repeated clicks and app restarts reuse that pending copy instead of creating another archive. Native
+installation still requires confirmation in Modrinth; it is not reported as complete at handoff.
+
+To explicitly select a different independent local profile, click **Enable automatic updates at login**.
 This copies the updater to your Local AppData folder and registers it for your Windows account,
 without administrator rights. It starts immediately and on subsequent logins, with a tray icon
 and no settings window or graphics context. Closing the settings window leaves the worker running.
@@ -47,7 +63,8 @@ continuous integrity scan; use the manual Check button to diagnose locally chang
 
 Right-click the tray icon for **Open updater / status**, **Check now**, or **Exit after current
 update**. Exit stops this run; **Disable automatic updates** in the window also removes login
-startup. An update already installing finishes safely before exit. Other profiles are not enrolled
+startup and pauses updating while the tray stays available. An update already installing finishes
+safely before exit. Other profiles are not enrolled
 implicitly. The worker verifies the enrolled profile ID and refuses shared/linked profiles and
 arbitrary imported modpacks. Only our marked, fully installed local migration import is also accepted,
 with its matching local filename and no remote references. It also refuses

@@ -32,7 +32,7 @@ with sqlite3.connect(db_path) as db:
 settings = {"enabled": True, "profile": str(profile), "instance_id": "local:fixture"}
 settings_path = home / "background-profile.json"
 settings_path.write_text(json.dumps(settings), encoding="utf-8")
-env = dict(os.environ, JANS_LAUNCHER_HOME=str(home))
+env = dict(os.environ, JANS_LAUNCHER_HOME=str(home), JANS_MODRINTH_HOME=str(profile.parent.parent))
 flags = subprocess.CREATE_NO_WINDOW
 
 def startup_value():
@@ -67,19 +67,45 @@ try:
         f"Get-Process -Id {worker.pid} | Select-Object WorkingSet64,PrivateMemorySize64,MainWindowHandle | ConvertTo-Json"
     ], creationflags=flags))
     assert metrics["MainWindowHandle"] == 0, metrics
+    settings["enabled"] = False
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = json.loads((home / "background-status.json").read_text())
+        if status.get("phase") == "paused": break
+        time.sleep(0.1)
+    assert status["phase"] == "paused" and worker.poll() is None
 finally:
-    # Exercise normal disable rather than killing a process or abandoning a running updater.
+    # Pause updates, then request explicit tray exit without killing the process.
     settings["enabled"] = False
     tmp = home / "disabled.json"
     tmp.write_text(json.dumps(settings), encoding="utf-8")
     os.replace(tmp, settings_path)
+    (home / "background-exit").write_bytes(b"exit")
     worker.wait(timeout=15)
 
 assert worker.returncode == 0
 assert startup_value() == startup_before
 assert hashlib.sha256(db_path.read_bytes()).hexdigest() == db_before
 assert not (profile / "mods").exists()
+waiting_home = root / "waiting-user-data"
+waiting_home.mkdir()
+waiting = subprocess.Popen([str(exe), "--background"], env=dict(env, JANS_LAUNCHER_HOME=str(waiting_home)), creationflags=flags)
+try:
+    deadline = time.monotonic() + 15
+    waiting_status = {}
+    while time.monotonic() < deadline:
+        try: waiting_status = json.loads((waiting_home / "background-status.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError): pass
+        if waiting_status.get("phase") == "setup": break
+        time.sleep(0.1)
+    assert waiting.poll() is None and waiting_status.get("phase") == "setup", waiting_status
+finally:
+    (waiting_home / "background-exit").write_bytes(b"exit")
+    waiting.wait(timeout=15)
+assert waiting.returncode == 0 and startup_value() == startup_before
 report = dict(passed=True, shared_target_refused=True, duplicate_exited=True,
+              paused_resident=True, waiting_without_profile=True,
               disabled_cleanly=True, startup_unchanged=True, database_unchanged=True,
               metrics=metrics, status=status)
 (root / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

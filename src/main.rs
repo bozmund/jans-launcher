@@ -14,7 +14,10 @@ mod selfupdate;
 mod source;
 mod sync;
 mod transaction;
+mod updater_background;
 mod updater_profiles;
+#[cfg(windows)]
+mod updater_tray;
 mod util;
 
 use anyhow::Result;
@@ -28,6 +31,8 @@ use std::sync::Arc;
     about = "Jan's modpack launcher. Run without arguments for the window."
 )]
 struct Cli {
+    #[arg(long, hide = true)]
+    background: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -133,6 +138,13 @@ enum ModsCmd {
 
 fn main() {
     let cli = Cli::parse_from(std::env::args_os());
+    if cli.background {
+        if let Err(e) = updater_background::run() {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let Some(cmd) = cli.command else {
         if let Err(e) = gui::run() {
             eprintln!("{e:#}");
@@ -146,6 +158,16 @@ fn main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+async fn apply(
+    client: &reqwest::Client,
+    path: &std::path::Path,
+    changes: &sync::Changes,
+    progress: sync::ProgressFn,
+) -> Result<()> {
+    updater_profiles::from_directory(path)?.compatible(&changes.manifest)?;
+    sync::apply(client, path, changes, progress).await
 }
 
 /// The exe is a GUI app on Windows; when started from a terminal, print there.

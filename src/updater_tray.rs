@@ -18,7 +18,10 @@ fn icon(hwnd: HWND) -> NOTIFYICONDATAW {
     data.uID = 1;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = CALLBACK;
-    data.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+    data.hIcon = unsafe { LoadIconW(GetModuleHandleW(std::ptr::null()), 1usize as *const u16) };
+    if data.hIcon.is_null() {
+        data.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+    }
     let tip = wide("Jan's Modpack Updater — right-click for controls");
     data.szTip[..tip.len()].copy_from_slice(&tip);
     data
@@ -111,9 +114,18 @@ pub fn run() -> Result<()> {
             std::ptr::null(),
         );
         ensure!(!hwnd.is_null(), "Could not create the tray window");
+        // Explorer can still be starting when Windows launches login applications.
+        let mut added = false;
+        for _ in 0..30 {
+            if Shell_NotifyIconW(NIM_ADD, &icon(hwnd)) != 0 {
+                added = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
         ensure!(
-            Shell_NotifyIconW(NIM_ADD, &icon(hwnd)) != 0,
-            "Could not add the tray icon"
+            added,
+            "Could not add the tray icon after waiting for Windows Explorer"
         );
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

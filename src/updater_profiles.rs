@@ -81,6 +81,13 @@ pub fn from_app_root(root: &Path) -> Result<Vec<Profile>> {
 }
 
 pub fn discover() -> Result<Vec<Profile>> {
+    if let Some(root) = std::env::var_os("JANS_MODRINTH_HOME") {
+        let root = PathBuf::from(root);
+        if !root.join("app.db").exists() {
+            return Ok(vec![]);
+        }
+        return from_app_root(&root);
+    }
     let base =
         directories::BaseDirs::new().context("Cannot locate your application data directory")?;
     let root = base.data_dir().join("ModrinthApp");
