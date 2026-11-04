@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: jans-launcher.exe
+            asset: jans-launcher-windows-x86_64.exe
+          # Oldest supported Ubuntu runner, so the binary works on older glibc distros too.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: jans-launcher
+            asset: jans-launcher-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+      - name: Build
+        env:
+          JANS_MSA_CLIENT_ID: ${{ vars.JANS_MSA_CLIENT_ID }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.asset }}
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p pkg/jans-launcher
+            cp target/${{ matrix.target }}/release/jans-launcher pkg/jans-launcher/
+            cp packaging/jans-launcher.desktop packaging/install.sh assets/icon.png pkg/jans-launcher/
+            tar -C pkg -czf dist/jans-launcher-linux-x86_64.tar.gz jans-launcher
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

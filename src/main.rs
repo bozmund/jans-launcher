@@ -1,0 +1,255 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod auth;
+mod config;
+mod gui;
+mod import;
+mod java;
+mod launch;
+mod manifest;
+mod publish;
+mod selfupdate;
+mod source;
+mod sync;
+mod transaction;
+mod util;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Jan's modpack launcher. Run without arguments for the window."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Build a new pack version from a profile folder (for the pack author).
+    Publish {
+        /// Profile to read (the live Modrinth profile).
+        #[arg(long)]
+        profile: PathBuf,
+        /// Pack repository checkout (holds publish.toml, pack.json, overrides/).
+        #[arg(long)]
+        pack: PathBuf,
+        /// Changelog text for this version.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Read the changelog text from a file.
+        #[arg(long, conflicts_with = "message")]
+        message_file: Option<PathBuf>,
+        /// Version label (default: today's date).
+        #[arg(long)]
+        version: Option<String>,
+        /// Copy own jars into <pack>/assets instead of uploading to GitHub.
+        #[arg(long)]
+        local_assets: bool,
+        /// Only show what would change.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show what an update would change.
+    Check {
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Update the instance to the newest pack version.
+    Update {
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Install the game files and start Minecraft with the instance.
+    Play {
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        /// Offline name for local testing (singleplayer only).
+        #[arg(long)]
+        offline: Option<String>,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse_from(std::env::args_os());
+    let Some(cmd) = cli.command else {
+        if let Err(e) = gui::run() {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    };
+    attach_console();
+    let rt = tokio::runtime::Runtime::new().expect("tokio");
+    if let Err(e) = rt.block_on(run_cli(cmd)) {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// The exe is a GUI app on Windows; when started from a terminal, print there.
+fn attach_console() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+fn cli_progress() -> sync::ProgressFn {
+    let last = std::sync::Mutex::new((String::new(), 0u64));
+    Arc::new(move |what: &str, done: u64, total: u64| {
+        let pct = if total == 0 { 100 } else { done * 100 / total };
+        let mut l = last.lock().unwrap();
+        if l.0 != what || pct >= l.1 + 10 || (pct == 100 && l.1 != 100) {
+            println!(
+                "  {what}: {pct}% ({} / {})",
+                util::human_bytes(done),
+                util::human_bytes(total)
+            );
+            *l = (what.to_string(), pct);
+        }
+    })
+}
+
+async fn run_cli(cmd: Cmd) -> Result<()> {
+    let settings = config::Settings::load();
+    let client = util::http();
+    match cmd {
+        Cmd::Publish {
+            profile,
+            pack,
+            message,
+            message_file,
+            version,
+            local_assets,
+            dry_run,
+        } => {
+            let message = match message_file {
+                Some(f) => Some(std::fs::read_to_string(f)?),
+                None => message,
+            };
+            publish::run(publish::Options {
+                profile,
+                pack,
+                message,
+                version,
+                local_assets,
+                dry_run,
+            })
+            .await
+        }
+        Cmd::Check { instance, source } => {
+            let instance = instance.unwrap_or_else(|| settings.instance_dir());
+            let src =
+                source::PackSource::parse(source.as_deref().unwrap_or(&settings.pack_source))?;
+            let fetched = src.fetch(&client).await?;
+            let changes =
+                tokio::task::spawn_blocking(move || sync::plan(&instance, fetched)).await??;
+            print_changes(&changes);
+            Ok(())
+        }
+        Cmd::Update { instance, source } => {
+            let instance = instance.unwrap_or_else(|| settings.instance_dir());
+            let src =
+                source::PackSource::parse(source.as_deref().unwrap_or(&settings.pack_source))?;
+            let fetched = src.fetch(&client).await?;
+            let inst = instance.clone();
+            let changes = tokio::task::spawn_blocking(move || sync::plan(&inst, fetched)).await??;
+            print_changes(&changes);
+            if changes.up_to_date() {
+                return Ok(());
+            }
+            sync::apply(&client, &instance, &changes, cli_progress()).await?;
+            println!("Updated to {}.", changes.new_version);
+            Ok(())
+        }
+        Cmd::Play { instance, offline } => {
+            let instance = instance.unwrap_or_else(|| settings.instance_dir());
+            let _lock = transaction::InstanceLock::acquire(&instance)?;
+            transaction::ensure_game_stopped(&instance)?;
+            transaction::recover(&instance)?;
+            let manifest = sync::installed_manifest(&instance).ok_or_else(|| {
+                anyhow::anyhow!("instance has no pack installed; run update first")
+            })?;
+            let account = match offline {
+                Some(name) => auth::Account::offline(&name),
+                None => gui::fresh_account(&client, &settings).await?,
+            };
+            let opts = launch::LaunchOptions {
+                data: config::data_dir(),
+                game_dir: instance,
+                minecraft: manifest.minecraft.clone(),
+                fabric_loader: manifest.fabric_loader.clone(),
+                memory_mb: settings.memory_mb,
+                extra_jvm_args: settings.extra_jvm_args.clone(),
+                java_override: settings.java_path.clone(),
+                account,
+            };
+            let mut child = launch::launch(&client, &opts, cli_progress()).await?;
+            println!("Minecraft started (pid {:?}).", child.id());
+            let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+            let (mut stdout, mut stderr) = (tokio::io::stdout(), tokio::io::stderr());
+            let (a, b) = tokio::join!(
+                tokio::io::copy(&mut out, &mut stdout),
+                tokio::io::copy(&mut err, &mut stderr)
+            );
+            a?;
+            b?;
+            let status = child.wait().await?;
+            println!("Minecraft exited: {status}");
+            Ok(())
+        }
+    }
+}
+
+fn print_changes(c: &sync::Changes) {
+    println!(
+        "{}: installed {} -> newest {} (build {})",
+        c.pack_name,
+        c.installed_version.as_deref().unwrap_or("nothing"),
+        c.new_version,
+        c.new_build
+    );
+    for e in &c.changelog {
+        println!("\n== {} ({}) ==\n{}", e.version, e.date, e.text.trim());
+    }
+    for i in &c.added {
+        println!("  + {} {}", i.name, i.version.as_deref().unwrap_or(""));
+    }
+    for (o, n) in &c.updated {
+        println!(
+            "  ~ {} {} -> {}",
+            n.name,
+            o.version.as_deref().unwrap_or("?"),
+            n.version.as_deref().unwrap_or("?")
+        );
+    }
+    for i in &c.removed {
+        println!("  - {}", i.name);
+    }
+    if c.other_files_changed > 0 {
+        println!("  {} other file(s) changed", c.other_files_changed);
+    }
+    let trash = c
+        .actions
+        .iter()
+        .filter(|a| matches!(a, sync::Action::Trash(_)))
+        .count();
+    println!(
+        "Work: {} download(s) ({}), {} file(s) to trash{}",
+        c.actions.len() - trash,
+        util::human_bytes(c.download_bytes),
+        trash,
+        if c.up_to_date() { " - up to date" } else { "" }
+    );
+}

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Jan's Launcher
+Comment=Update and play Jan's modpack
+Exec=jans-launcher
+Icon=jans-launcher
+Terminal=false
+Categories=Game;
