@@ -56,23 +56,6 @@ impl Account {
         let _ = std::fs::remove_file(account_path());
     }
 
-    /// Offline account for local testing only (singleplayer; servers reject it).
-    pub fn offline(name: &str) -> Account {
-        use md5::Digest;
-        let mut h: [u8; 16] = md5::Md5::digest(format!("OfflinePlayer:{name}").as_bytes()).into();
-        h[6] = (h[6] & 0x0f) | 0x30;
-        h[8] = (h[8] & 0x3f) | 0x80;
-        Account {
-            name: name.to_string(),
-            uuid: hex::encode(h),
-            access_token: "0".into(),
-            user_type: "legacy".into(),
-            xuid: "0".into(),
-            expires_at: u64::MAX,
-            refresh_token: None,
-        }
-    }
-
     pub fn needs_refresh(&self) -> bool {
         self.expires_at < now() + 300
     }
@@ -236,15 +219,7 @@ async fn minecraft_from_ms(client: &reqwest::Client, ms: &Value) -> Result<Accou
         .to_string();
     let expires_in = mc["expires_in"].as_u64().unwrap_or(86400);
 
-    let profile_resp = client
-        .get("https://api.minecraftservices.com/minecraft/profile")
-        .bearer_auth(&mc_token)
-        .send()
-        .await?;
-    if profile_resp.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("this account does not own Minecraft Java Edition");
-    }
-    let profile: Value = profile_resp.error_for_status()?.json().await?;
+    let profile = verify_game_access(client, &mc_token).await?;
     Ok(Account {
         name: profile["name"]
             .as_str()
@@ -261,4 +236,83 @@ async fn minecraft_from_ms(client: &reqwest::Client, ms: &Value) -> Result<Accou
         expires_at: now() + expires_in,
         refresh_token,
     })
+}
+
+/// Verify current access with Minecraft Services; cached local identity never authorizes Play.
+pub async fn verify_game_access(client: &reqwest::Client, token: &str) -> Result<Value> {
+    anyhow::ensure!(
+        !token.is_empty() && token != "0",
+        "Sign in with Microsoft before playing"
+    );
+    let entitlements: Value = client
+        .get("https://api.minecraftservices.com/entitlements/mcstore")
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()
+        .context("Minecraft ownership verification failed")?
+        .json()
+        .await?;
+    check_entitlements(&entitlements)?;
+    let response = client
+        .get("https://api.minecraftservices.com/minecraft/profile")
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "No Minecraft Java profile. Check your game entitlement and create your Java profile in the official launcher if needed."
+        );
+    }
+    let profile: Value = response
+        .error_for_status()
+        .context("Minecraft profile verification failed")?
+        .json()
+        .await?;
+    let id = profile["id"]
+        .as_str()
+        .context("Minecraft response has no profile ID")?;
+    anyhow::ensure!(
+        id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid Minecraft profile ID"
+    );
+    anyhow::ensure!(
+        profile["name"].as_str().is_some_and(|s| !s.is_empty()),
+        "Minecraft response has no player name"
+    );
+    Ok(profile)
+}
+
+fn check_entitlements(value: &Value) -> Result<()> {
+    let owned = value["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            matches!(
+                item["name"].as_str(),
+                Some("game_minecraft" | "product_minecraft")
+            )
+        })
+    });
+    anyhow::ensure!(
+        owned,
+        "This Microsoft account has no active Minecraft Java Edition entitlement"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ownership_requires_a_java_entitlement() {
+        assert!(check_entitlements(&json!({"items":[{"name":"game_minecraft"}]})).is_ok());
+        assert!(check_entitlements(&json!({"items":[{"name":"product_minecraft"}]})).is_ok());
+        for invalid in [
+            json!({}),
+            json!({"items":[]}),
+            json!({"items":[{"name":"unrelated-product"}]}),
+            json!({"items":"game_minecraft"}),
+        ] {
+            assert!(check_entitlements(&invalid).is_err());
+        }
+    }
 }

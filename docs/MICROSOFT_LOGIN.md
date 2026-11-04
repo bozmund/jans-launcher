@@ -4,13 +4,13 @@ Minecraft accounts are Microsoft accounts. A launcher logs in through an **Azure
 (a client id). Since 2023 Mojang only lets an app id use the Minecraft login API after it has been
 **approved**; until then the last step returns HTTP 403 and the launcher says so.
 
-Until approval arrives, friends can still use jans-launcher for updates: *Settings → Instance folder
-→ Use an existing profile* (their Modrinth App profile), then update here and play from Modrinth App.
+Until approval arrives, pack downloads and mod management work independently. Integrated Play
+requires configured Microsoft authentication; there is no automatic Modrinth App fallback.
+Owner setup: [MICROSOFT_SETUP.md](MICROSOFT_SETUP.md).
 
 ## 1. Register the Azure app (free, ~5 minutes)
 
-1. Sign in at <https://portal.azure.com> with a Microsoft account (a free account is enough; no
-   subscription is needed for app registrations).
+1. Sign in at <https://portal.azure.com> with a Microsoft account (your account needs permission to register applications in an Entra directory).
 2. Search for **App registrations** → **New registration**.
    * Name: `Jan's Launcher`
    * Supported account types: **Personal Microsoft accounts only**
@@ -31,7 +31,7 @@ review form", or <https://aka.ms/mce-reviewappid>) with:
 * a short description: "Open-source modpack launcher for a group of friends; device-code login,
   launches the vanilla client with Fabric."
 
-Approval takes from a few days to a few weeks. You get an email.
+Follow the current form instructions; no approval time is guaranteed.
 
 ## 3. Put the client id into the launcher
 

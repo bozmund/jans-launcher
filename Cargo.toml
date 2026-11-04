@@ -1,6 +1,6 @@
 [package]
 name = "jans-launcher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "One-click modpack updater and Minecraft launcher for Jan's Fabric pack"
 license = "MIT"

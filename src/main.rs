@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod auth;
+mod catalog;
 mod config;
 mod gui;
 mod import;
@@ -31,6 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect the mod catalog without opening the window.
+    Mods {
+        #[command(subcommand)]
+        command: ModsCmd,
+    },
     /// Build a new pack version from a profile folder (for the pack author).
     Publish {
         /// Profile to read (the live Modrinth profile).
@@ -73,9 +79,42 @@ enum Cmd {
     Play {
         #[arg(long)]
         instance: Option<PathBuf>,
-        /// Offline name for local testing (singleplayer only).
+    },
+}
+
+#[derive(Subcommand)]
+enum ModsCmd {
+    /// Explicitly install a mod and required dependencies into a selected instance.
+    Install {
+        project: String,
         #[arg(long)]
-        offline: Option<String>,
+        instance: PathBuf,
+        #[arg(long, default_value = "26.3")]
+        game: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value = "26.3")]
+        game: String,
+    },
+    List {
+        #[arg(long)]
+        instance: Option<PathBuf>,
+    },
+    Updates {
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        #[arg(long, default_value = "26.3")]
+        game: String,
+    },
+    Preview {
+        project: String,
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        #[arg(long, default_value = "26.3")]
+        game: String,
     },
 }
 
@@ -125,6 +164,69 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
     let settings = config::Settings::load();
     let client = util::http();
     match cmd {
+        Cmd::Mods { command } => {
+            match command {
+                ModsCmd::Install {
+                    project,
+                    instance,
+                    game,
+                    confirm,
+                } => {
+                    anyhow::ensure!(confirm, "Use mods preview first, then --confirm to install");
+                    let previous = catalog::inventory(&instance)?;
+                    let version = catalog::versions(&client, &project, &game)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("No compatible version"))?;
+                    let plan = catalog::prepare(&client, version, &game, previous).await?;
+                    catalog::install(&client, &instance, plan, cli_progress()).await?;
+                    println!("Mods installed.");
+                }
+                ModsCmd::Search { query, game } => {
+                    let result = catalog::search(&client, &query, &game, 0).await?;
+                    for hit in result.hits {
+                        println!("{}\t{}\t{}", hit.project_id, hit.title, hit.description);
+                    }
+                }
+                ModsCmd::List { instance } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&catalog::inventory(
+                            &instance.unwrap_or_else(|| settings.instance_dir())
+                        )?)?
+                    );
+                }
+                ModsCmd::Updates { instance, game } => {
+                    let mods =
+                        catalog::inventory(&instance.unwrap_or_else(|| settings.instance_dir()))?;
+                    for u in catalog::updates(&client, &mods, &game).await? {
+                        println!(
+                            "{}: {} -> {}",
+                            u.installed.name, u.installed.version, u.version.version_number
+                        );
+                    }
+                }
+                ModsCmd::Preview {
+                    project,
+                    instance,
+                    game,
+                } => {
+                    let previous =
+                        catalog::inventory(&instance.unwrap_or_else(|| settings.instance_dir()))?;
+                    let version = catalog::versions(&client, &project, &game)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("No compatible version"))?;
+                    let plan = catalog::prepare(&client, version, &game, previous).await?;
+                    for v in plan.versions {
+                        println!("{}\t{}\t{}", v.project_id, v.name, v.version_number);
+                    }
+                }
+            }
+            Ok(())
+        }
         Cmd::Publish {
             profile,
             pack,
@@ -173,7 +275,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             println!("Updated to {}.", changes.new_version);
             Ok(())
         }
-        Cmd::Play { instance, offline } => {
+        Cmd::Play { instance } => {
             let instance = instance.unwrap_or_else(|| settings.instance_dir());
             let _lock = transaction::InstanceLock::acquire(&instance)?;
             transaction::ensure_game_stopped(&instance)?;
@@ -181,10 +283,7 @@ async fn run_cli(cmd: Cmd) -> Result<()> {
             let manifest = sync::installed_manifest(&instance).ok_or_else(|| {
                 anyhow::anyhow!("instance has no pack installed; run update first")
             })?;
-            let account = match offline {
-                Some(name) => auth::Account::offline(&name),
-                None => gui::fresh_account(&client, &settings).await?,
-            };
+            let account = gui::fresh_account(&client, &settings).await?;
             let opts = launch::LaunchOptions {
                 data: config::data_dir(),
                 game_dir: instance,

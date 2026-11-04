@@ -1,6 +1,6 @@
 # Jan's Launcher
 
-A small, fast modpack updater and Minecraft launcher, written in Rust, for one Fabric modpack shared
+A standalone modpack updater and Minecraft launcher, written in Rust, for one Fabric modpack shared
 between friends. Friends click **Update** and **Play**; the pack author publishes a new version with
 one command. Runs on Windows and Linux as a single executable.
 
@@ -35,8 +35,7 @@ information about what changed.
 * **Update**: downloads only what changed.
 * **Play**: downloads Java (Mojang's own runtime), Minecraft, Fabric and assets on first start, then
   launches the game. Requires a Microsoft login (see below).
-* Settings: memory, instance folder, extra JVM args, custom Java, import of worlds/options from an
-  existing Modrinth App or Prism profile, Croatian / English.
+* Settings: memory, extra JVM args, custom Java, Microsoft account, English.
 * The launcher updates itself from this repository's GitHub releases (checksum-verified).
 
 ### What is never touched
@@ -57,12 +56,17 @@ Windows SmartScreen may warn because the exe is not signed: *More info → Run a
 **Linux:** download `jans-launcher-linux-x86_64.tar.gz`, extract it and run `./install.sh` (adds it
 to your app menu), or just run the `jans-launcher` binary. NixOS: `nix run github:bozmund/jans-launcher`.
 
-For the first release, **choose your existing Modrinth profile → Check for changes → Update →
-Play in Modrinth**. Microsoft login is not needed for updates. The launcher opens Modrinth for
-Minecraft login and starting that profile while this app's Microsoft client ID is awaiting approval.
+There is exactly one app-owned instance: **Jan's Fabric 26.3**. There is no profile picker, external-launcher dependency or pack-source setting in the UI. Legacy profile folders are not deleted or modified when opening the dedicated launcher. **Overview → Download update** installs the current shared
+pack. **Settings & account → Sign in with Microsoft** enables integrated Play once the launcher's
+Microsoft application is registered and approved. This app never automatically opens Modrinth.
+For the one-time owner setup, see [Registration steps](docs/MICROSOFT_SETUP.md).
 
-Once a Microsoft client ID is approved and configured, you can instead log in here and use the
-integrated Play button.
+**Discover mods** searches Modrinth for Fabric versions matching the active Minecraft version.
+Preview resolves required dependencies before explicit installation. **Installed mods** lists actual
+JAR files. **Mod updates** checks compatible upstream versions by installed file hash. Custom
+unpublished ports are updated through pack Fetch; absence from the upstream API is not proof they
+are current. Manually updating a pack-managed mod changes your local instance; the next pack Update
+restores that mod to the published pack version. No mods are upgraded automatically.
 
 Close Minecraft before updating. All downloads are verified and cached before any installed mod
 is replaced. A failed download leaves the previous pack intact; a failed or interrupted file swap
@@ -70,8 +74,7 @@ is rolled back. Old files are retained under `.jans-launcher/trash/`. The first 
 profile moves earlier versions of the same Fabric mod IDs aside, leaving unrelated extra mods alone.
 World imports skip an existing world entirely rather than mixing its chunks with another world.
 
-Moving from Modrinth App: *Settings → Import from another launcher*, pick your old profile, click
-*Import*. Worlds, options and servers are copied over.
+The developer CLI retains explicit instance paths for isolated tests; these are not additional player profiles.
 
 ## For the pack author
 
@@ -98,7 +101,7 @@ The window is the main interface; these exist for the pack author and for testin
 | `jans-launcher publish --profile P --pack R [-m TEXT] [--dry-run] [--local-assets]` | Build a new pack version |
 | `jans-launcher check [--instance DIR] [--source SRC]` | Print what an update would change |
 | `jans-launcher update [--instance DIR] [--source SRC]` | Update an instance |
-| `jans-launcher play [--instance DIR] [--offline NAME]` | Start the game (`--offline` for local tests only) |
+| `jans-launcher play [--instance DIR]` | Start the game after Microsoft authentication and ownership verification |
 
 `SRC` is `github:owner/repo@branch` or a local folder / URL containing `pack.json`.
 
@@ -126,3 +129,12 @@ Build-time options (environment variables):
 ## License
 
 MIT
+
+## Authentication and affiliation
+
+Jan's Launcher requires Microsoft sign-in and current Minecraft Java entitlement/profile verification
+before starting gameplay. It has no offline-account or environment-variable authentication bypass.
+The public client ID is `ebddfc17-e502-4c3e-9d64-92711868988f`; it is not a client secret. Minecraft API
+review is pending and no authenticated end-to-end launch is claimed until the service accepts this app.
+
+NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.

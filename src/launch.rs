@@ -430,6 +430,15 @@ pub async fn launch(
     o: &LaunchOptions,
     progress: ProgressFn,
 ) -> Result<tokio::process::Child> {
+    anyhow::ensure!(
+        o.account.user_type == "msa",
+        "Microsoft authentication is required before Play"
+    );
+    let verified = crate::auth::verify_game_access(client, &o.account.access_token).await?;
+    anyhow::ensure!(
+        verified["id"].as_str() == Some(o.account.uuid.as_str()),
+        "Signed-in Minecraft account changed; sign in again"
+    );
     let p = prepare(client, o, progress).await?;
     std::fs::create_dir_all(&o.game_dir)?;
     let sep = if cfg!(windows) { ";" } else { ":" };
@@ -440,7 +449,10 @@ pub async fn launch(
         .collect::<Vec<_>>()
         .join(sep);
     let vars: HashMap<&str, String> = HashMap::from([
-        ("auth_player_name", o.account.name.clone()),
+        (
+            "auth_player_name",
+            verified["name"].as_str().unwrap().to_string(),
+        ),
         ("version_name", p.version_id.clone()),
         ("game_directory", o.game_dir.to_string_lossy().into_owned()),
         (

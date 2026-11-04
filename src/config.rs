@@ -11,9 +11,14 @@ pub const DEFAULT_PACK_SOURCE: &str = match option_env!("JANS_PACK_SOURCE") {
     None => "github:bozmund/jans-modpack@main",
 };
 
+pub const PACK_MINECRAFT: &str = "26.3";
+
 /// Azure application (client) id used for Microsoft login. Baked in with `JANS_MSA_CLIENT_ID`, or
 /// set in settings.json.
-pub const DEFAULT_MSA_CLIENT_ID: Option<&str> = option_env!("JANS_MSA_CLIENT_ID");
+pub const DEFAULT_MSA_CLIENT_ID: Option<&str> = match option_env!("JANS_MSA_CLIENT_ID") {
+    Some(id) if !id.is_empty() => Some(id),
+    _ => Some("ebddfc17-e502-4c3e-9d64-92711868988f"),
+};
 
 /// GitHub repository the app updates itself from.
 pub const APP_REPO: &str = match option_env!("JANS_APP_REPO") {
@@ -23,8 +28,8 @@ pub const APP_REPO: &str = match option_env!("JANS_APP_REPO") {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Lang {
-    #[default]
     Hr,
+    #[default]
     En,
 }
 
@@ -50,7 +55,7 @@ impl Default for Settings {
             pack_source: DEFAULT_PACK_SOURCE.to_string(),
             instance_dir: None,
             memory_mb: 8192,
-            language: Lang::Hr,
+            language: Lang::En,
             extra_jvm_args: String::new(),
             java_path: None,
             msa_client_id: None,
@@ -72,6 +77,15 @@ pub fn data_dir() -> PathBuf {
 }
 
 impl Settings {
+    /// The GUI is a dedicated launcher for one pack, never a launcher/profile selector.
+    /// Legacy profile directories are left untouched; the dedicated instance is app-owned.
+    pub fn single_pack(mut self) -> Self {
+        self.pack_source = DEFAULT_PACK_SOURCE.into();
+        self.instance_dir = None;
+        self.language = Lang::En;
+        self
+    }
+
     pub fn path() -> PathBuf {
         data_dir().join("settings.json")
     }
@@ -102,5 +116,25 @@ impl Settings {
                     .filter(|s| !s.trim().is_empty())
                     .map(str::to_string)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn single_pack_ignores_legacy_profile_and_source_selection() {
+        let settings = Settings {
+            pack_source: "github:other/pack".into(),
+            instance_dir: Some(PathBuf::from("other-profile")),
+            memory_mb: 6144,
+            ..Settings::default()
+        }
+        .single_pack();
+        assert_eq!(settings.pack_source, DEFAULT_PACK_SOURCE);
+        assert!(settings.instance_dir.is_none());
+        assert_eq!(settings.memory_mb, 6144);
+        assert_eq!(PACK_MINECRAFT, "26.3");
+        assert_eq!(settings.language, Lang::En);
     }
 }

@@ -1,10 +1,10 @@
 //! The window friends use: check for changes, update, play.
 
 use crate::auth::{self, Account, DeviceCode};
-use crate::config::{self, Lang, Settings};
+use crate::config::{self, Settings};
 use crate::selfupdate::{self, AppRelease};
 use crate::sync::{self, Changes, ProgressFn};
-use crate::{import, launch, source, util};
+use crate::{catalog, launch, source, util};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
@@ -29,8 +29,8 @@ pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Jan's Launcher")
-            .with_inner_size([820.0, 620.0])
-            .with_min_inner_size([560.0, 420.0])
+            .with_inner_size([1180.0, 780.0])
+            .with_min_inner_size([900.0, 620.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
                     .unwrap_or_default(),
@@ -45,11 +45,8 @@ pub fn run() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Account ready to play with: offline test name, or the saved Microsoft login (refreshed if needed).
+/// Saved Microsoft account, refreshed if needed. Game access is verified again before launch.
 pub async fn fresh_account(client: &reqwest::Client, settings: &Settings) -> Result<Account> {
-    if let Ok(name) = std::env::var("JANS_LAUNCHER_OFFLINE") {
-        return Ok(Account::offline(&name));
-    }
     let acc = Account::load().context("not logged in")?;
     if !acc.needs_refresh() {
         return Ok(acc);
@@ -73,12 +70,19 @@ enum Msg {
     LaunchFailed(String),
     AppUpdate(Option<AppRelease>),
     AppUpdated(Result<()>),
-    Imported(Result<usize>),
+    CatalogSearch(Result<catalog::Search>),
+    Inventory(Result<Vec<catalog::Installed>>),
+    ModUpdates(Result<Vec<catalog::AvailableUpdate>>),
+    ModPlan(Result<catalog::InstallPlan>),
+    ModInstalled(Result<()>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Home,
+    Discover,
+    Installed,
+    Updates,
     Settings,
     Log,
 }
@@ -91,7 +95,8 @@ enum Busy {
     Playing,
     LoggingIn,
     SelfUpdating,
-    Importing,
+    Catalog,
+    InstallingMod,
 }
 
 struct App {
@@ -111,17 +116,43 @@ struct App {
     account: Option<Account>,
     device_code: Option<DeviceCode>,
     app_update: Option<AppRelease>,
-    profiles: Vec<(String, PathBuf)>,
-    import_from: Option<PathBuf>,
     play_after_update: bool,
     settings_dirty: bool,
+    query: String,
+    catalog_offset: usize,
+    catalog_result: Option<catalog::Search>,
+    inventory: Vec<catalog::Installed>,
+    mod_updates: Option<Vec<catalog::AvailableUpdate>>,
+    mod_plan: Option<catalog::InstallPlan>,
+    mod_filter: String,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> App {
+        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Dark)).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.panel_fill = Color32::from_rgb(23, 25, 29);
+        style.visuals.window_fill = Color32::from_rgb(31, 34, 40);
+        style.visuals.extreme_bg_color = Color32::from_rgb(17, 19, 23);
+        style.visuals.faint_bg_color = Color32::from_rgb(32, 35, 41);
+        style.visuals.selection.bg_fill = Color32::from_rgb(26, 110, 74);
+        style.visuals.hyperlink_color = GREEN;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 46, 54);
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(55, 61, 70);
+        style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+        style.spacing.button_padding = egui::vec2(16.0, 10.0);
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
         let (tx, rx) = channel();
         let mut app = App {
-            settings: Settings::load(),
+            settings: Settings::load().single_pack(),
             rt: tokio::runtime::Runtime::new().expect("tokio"),
             client: util::http(),
             tx,
@@ -137,12 +168,16 @@ impl App {
             account: Account::load(),
             device_code: None,
             app_update: None,
-            profiles: import::find_profiles(),
-            import_from: None,
             play_after_update: false,
             settings_dirty: false,
+            query: String::new(),
+            catalog_offset: 0,
+            catalog_result: None,
+            inventory: vec![],
+            mod_updates: None,
+            mod_plan: None,
+            mod_filter: String::new(),
         };
-        app.import_from = app.profiles.first().map(|p| p.1.clone());
         app.check();
         if app.settings.check_app_updates {
             let (client, tx, ctx) = (app.client.clone(), app.tx.clone(), app.ctx.clone());
@@ -156,14 +191,6 @@ impl App {
             });
         }
         app
-    }
-
-    fn t(&self, hr: &'static str, en: &'static str) -> &'static str {
-        if self.settings.language == Lang::Hr {
-            hr
-        } else {
-            en
-        }
     }
 
     fn sender(&self) -> impl Fn(Msg) + Send + Clone + 'static {
@@ -194,6 +221,10 @@ impl App {
         self.rt.spawn(async move {
             let r = async {
                 let fetched = source::PackSource::parse(&src)?.fetch(&client).await?;
+                anyhow::ensure!(
+                    fetched.manifest.minecraft == config::PACK_MINECRAFT,
+                    "This launcher supports only Jan's Fabric 26.3 pack"
+                );
                 tokio::task::spawn_blocking(move || sync::plan(&inst, fetched)).await?
             }
             .await;
@@ -223,43 +254,16 @@ impl App {
 
     fn play(&mut self) {
         let inst = self.settings.instance_dir();
-        if self.account.is_none()
-            && self.settings.client_id().is_none()
-            && std::env::var("JANS_LAUNCHER_OFFLINE").is_err()
-        {
-            if self.settings.instance_dir.is_none() {
-                self.tab = Tab::Settings;
-                self.error = Some(
-                    self.t(
-                        "Odaberi postojeći Modrinth profil za ažuriranja.",
-                        "Choose your existing Modrinth profile for updates.",
-                    )
+        if self.account.is_none() {
+            self.tab = Tab::Settings;
+            self.error = Some(
+                "Sign in with Microsoft for standalone play. See application setup in Settings."
                     .into(),
-                );
-                return;
-            }
-            match open::that("modrinth://") {
-                Ok(()) => {
-                    self.status = self
-                        .t(
-                            "Modrinth je otvoren. Pokreni ažurirani profil.",
-                            "Modrinth opened. Start your updated profile.",
-                        )
-                        .into()
-                }
-                Err(e) => self.error = Some(format!("Modrinth: {e}")),
-            }
-            self.check();
+            );
             return;
         }
         let Some(_manifest) = sync::installed_manifest(&inst) else {
-            self.error = Some(
-                self.t(
-                    "Pack još nije instaliran.",
-                    "The pack is not installed yet.",
-                )
-                .into(),
-            );
+            self.error = Some("The pack is not installed yet.".into());
             return;
         };
         self.busy = Some(Busy::Launching);
@@ -346,26 +350,57 @@ impl App {
 
     fn handle(&mut self, m: Msg) {
         match m {
+            Msg::CatalogSearch(r) => {
+                self.busy = None;
+                match r {
+                    Ok(result) => self.catalog_result = Some(result),
+                    Err(e) => self.fail("Catalog", e),
+                }
+            }
+            Msg::Inventory(r) => {
+                self.busy = None;
+                match r {
+                    Ok(result) => self.inventory = result,
+                    Err(e) => self.fail("Installed mods", e),
+                }
+            }
+            Msg::ModUpdates(r) => {
+                self.busy = None;
+                match r {
+                    Ok(result) => self.mod_updates = Some(result),
+                    Err(e) => self.fail("Mod updates", e),
+                }
+            }
+            Msg::ModPlan(r) => {
+                self.busy = None;
+                match r {
+                    Ok(result) => self.mod_plan = Some(result),
+                    Err(e) => self.fail("Installation preview", e),
+                }
+            }
+            Msg::ModInstalled(r) => {
+                self.busy = None;
+                self.mod_plan = None;
+                match r {
+                    Ok(()) => {
+                        self.status = "Mods installed.".into();
+                        self.load_inventory(false);
+                    }
+                    Err(e) => self.fail("Mod installation", e),
+                }
+            }
             Msg::Changes(r) => {
                 self.busy = None;
                 match r {
                     Ok(c) => {
                         self.status = if c.up_to_date() {
-                            format!(
-                                "{} {}",
-                                self.t("Sve je ažurno:", "Up to date:"),
-                                c.new_version
-                            )
+                            format!("{} {}", "Up to date:", c.new_version)
                         } else {
-                            format!(
-                                "{} {}",
-                                self.t("Dostupna je nova verzija:", "New version available:"),
-                                c.new_version
-                            )
+                            format!("{} {}", "New version available:", c.new_version)
                         };
                         self.changes = Some(c);
                     }
-                    Err(e) => self.fail(self.t("Provjera nije uspjela", "Check failed"), e),
+                    Err(e) => self.fail("Check failed", e),
                 }
             }
             Msg::Updated(r) => {
@@ -382,7 +417,7 @@ impl App {
                     }
                     Err(e) => {
                         self.play_after_update = false;
-                        self.fail(self.t("Ažuriranje nije uspjelo", "Update failed"), e)
+                        self.fail("Update failed", e)
                     }
                 }
             }
@@ -393,29 +428,21 @@ impl App {
                 self.device_code = None;
                 match r {
                     Ok(a) => self.account = Some(a),
-                    Err(e) => self.fail(self.t("Prijava nije uspjela", "Login failed"), e),
+                    Err(e) => self.fail("Login failed", e),
                 }
             }
             Msg::GameStarted => {
                 self.busy = Some(Busy::Playing);
-                self.status = self
-                    .t("Minecraft je pokrenut.", "Minecraft is running.")
-                    .into();
+                self.status = "Minecraft is running.".into();
             }
             Msg::GameExited(s) => {
                 self.busy = None;
-                self.status = format!(
-                    "{} ({s})",
-                    self.t("Minecraft je zatvoren", "Minecraft closed")
-                );
+                self.status = format!("{} ({s})", "Minecraft closed");
                 self.push_log(format!("game exited: {s}"));
             }
             Msg::LaunchFailed(e) => {
                 self.busy = None;
-                self.error = Some(format!(
-                    "{}: {e}",
-                    self.t("Pokretanje nije uspjelo", "Launch failed")
-                ));
+                self.error = Some(format!("{}: {e}", "Launch failed"));
                 self.push_log(e);
             }
             Msg::AppUpdate(r) => self.app_update = r,
@@ -423,23 +450,7 @@ impl App {
                 self.busy = None;
                 match r {
                     Ok(()) => selfupdate::restart(),
-                    Err(e) => self.fail(
-                        self.t(
-                            "Ažuriranje launchera nije uspjelo",
-                            "Launcher update failed",
-                        ),
-                        e,
-                    ),
-                }
-            }
-            Msg::Imported(r) => {
-                self.busy = None;
-                match r {
-                    Ok(n) => {
-                        self.status =
-                            format!("{} {n}", self.t("Uvezeno datoteka:", "Files imported:"))
-                    }
-                    Err(e) => self.fail(self.t("Uvoz nije uspio", "Import failed"), e),
+                    Err(e) => self.fail("Launcher update failed", e),
                 }
             }
         }
@@ -462,52 +473,89 @@ impl App {
 
     fn ui_top(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let name = self
-                .changes
-                .as_ref()
-                .map(|c| c.pack_name.clone())
-                .unwrap_or_else(|| "Jan's Launcher".into());
-            ui.heading(name);
+            ui.label(
+                RichText::new("JAN'S LAUNCHER")
+                    .strong()
+                    .color(GREEN)
+                    .size(17.0),
+            );
+            ui.separator();
+            ui.label("Your Minecraft, in one place");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let other = if self.settings.language == Lang::Hr {
-                    "EN"
-                } else {
-                    "HR"
-                };
-                if ui.small_button(other).clicked() {
-                    self.settings.language = if self.settings.language == Lang::Hr {
-                        Lang::En
-                    } else {
-                        Lang::Hr
-                    };
-                    let _ = self.settings.save();
-                }
-                let tabs = [
-                    (Tab::Log, self.t("Zapisnik", "Log")),
-                    (Tab::Settings, self.t("Postavke", "Settings")),
-                    (Tab::Home, self.t("Početna", "Home")),
-                ];
-                for (tab, label) in tabs {
-                    ui.selectable_value(&mut self.tab, tab, label);
-                }
+                ui.label(
+                    self.account
+                        .as_ref()
+                        .map(|a| a.name.as_str())
+                        .unwrap_or("Microsoft account"),
+                );
+                ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).weak());
             });
         });
+    }
+
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.label(RichText::new("LIBRARY").weak().size(11.0));
+        for (tab, label) in [
+            (Tab::Home, "Overview"),
+            (Tab::Installed, "Installed mods"),
+            (Tab::Discover, "Discover mods"),
+            (Tab::Updates, "Mod updates"),
+            (Tab::Log, "Activity & logs"),
+            (Tab::Settings, "Settings & account"),
+        ] {
+            if ui
+                .add_sized(
+                    [190.0, 40.0],
+                    egui::Button::new(label).selected(self.tab == tab),
+                )
+                .clicked()
+            {
+                self.tab = tab;
+                if self.busy.is_none() {
+                    if tab == Tab::Installed {
+                        self.load_inventory(false);
+                    }
+                    if tab == Tab::Updates {
+                        self.load_inventory(true);
+                    }
+                    if tab == Tab::Discover && self.catalog_result.is_none() {
+                        self.search_mods();
+                    }
+                }
+            }
+        }
+        ui.add_space(24.0);
+        ui.separator();
+        ui.label(RichText::new("Jan's Fabric 26.3").strong());
+        ui.label(RichText::new("Your modpack").weak().size(12.0));
+        ui.add_space(18.0);
+        ui.label(RichText::new("Minecraft 26.3 · Fabric").weak().size(12.0));
+        ui.label(
+            RichText::new("No 500 MB pack limit")
+                .color(GREEN)
+                .size(12.0),
+        );
     }
 
     fn ui_bottom(&mut self, ui: &mut egui::Ui) {
         if let Some(busy) = self.busy {
             let label = match busy {
-                Busy::Checking => self.t("Provjeravam…", "Checking…"),
-                Busy::Updating => self.t("Ažuriram…", "Updating…"),
-                Busy::Launching => self.t("Pripremam igru…", "Preparing the game…"),
-                Busy::Playing => self.t("Igra je pokrenuta", "Game is running"),
-                Busy::LoggingIn => self.t("Čekam prijavu…", "Waiting for login…"),
-                Busy::SelfUpdating => self.t("Ažuriram launcher…", "Updating launcher…"),
-                Busy::Importing => self.t("Uvozim…", "Importing…"),
+                Busy::Checking => "Checking…",
+                Busy::Updating => "Updating…",
+                Busy::Launching => "Preparing the game…",
+                Busy::Playing => "Game is running",
+                Busy::LoggingIn => "Waiting for login…",
+                Busy::SelfUpdating => "Updating launcher…",
+                Busy::Catalog => "Fetching mods…",
+                Busy::InstallingMod => "Installing mods…",
             };
             let p = self.progress.lock().unwrap().clone();
             match (busy, p) {
-                (Busy::Updating | Busy::Launching, Some((what, done, total))) if total > 0 => {
+                (
+                    Busy::Updating | Busy::Launching | Busy::InstallingMod,
+                    Some((what, done, total)),
+                ) if total > 0 => {
                     let what = match what.as_str() {
                         "java" => "Java",
                         "game" => "Minecraft",
@@ -542,19 +590,12 @@ impl App {
         if let Some(rel) = self.app_update.clone() {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!(
-                        "{} {}",
-                        self.t("Nova verzija launchera:", "New launcher version:"),
-                        rel.version
-                    ))
-                    .color(AMBER),
+                    RichText::new(format!("{} {}", "New launcher version:", rel.version))
+                        .color(AMBER),
                 )
                 .on_hover_text(&rel.notes);
                 if ui
-                    .add_enabled(
-                        self.busy.is_none(),
-                        egui::Button::new(self.t("Ažuriraj launcher", "Update launcher")),
-                    )
+                    .add_enabled(self.busy.is_none(), egui::Button::new("Update launcher"))
                     .clicked()
                 {
                     self.busy = Some(Busy::SelfUpdating);
@@ -568,174 +609,207 @@ impl App {
             ui.separator();
         }
 
-        self.ui_account(ui);
-        ui.separator();
-
         let idle = self.busy.is_none();
-        let delegated = self.account.is_none()
-            && self.settings.client_id().is_none()
-            && std::env::var("JANS_LAUNCHER_OFFLINE").is_err();
-        if delegated && self.settings.instance_dir.is_none() {
-            ui.label(self.t(
-                "Odaberi Modrinth profil koji želiš ažurirati:",
-                "Choose the Modrinth profile to update:",
-            ));
-            for (label, path) in self.profiles.clone() {
-                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
-                    self.settings.instance_dir = Some(path);
-                    if let Err(e) = self.settings.save() {
-                        self.error = Some(e.to_string());
-                    }
-                    self.check();
-                }
-            }
-            if self.profiles.is_empty()
-                && ui
-                    .button(self.t("Odaberi mapu profila…", "Choose profile folder…"))
-                    .clicked()
-            {
-                self.tab = Tab::Settings;
-            }
-            return;
-        }
         let needs_update = self.changes.as_ref().is_some_and(|c| !c.up_to_date());
-        let installed = sync::installed_manifest(&self.settings.instance_dir()).is_some();
-        let can_play =
-            delegated || self.account.is_some() || std::env::var("JANS_LAUNCHER_OFFLINE").is_ok();
-        ui.horizontal(|ui| {
-            let big = |s: &str| {
-                egui::Button::new(RichText::new(s).size(18.0)).min_size(egui::vec2(150.0, 40.0))
-            };
-            if ui
-                .add_enabled(idle, big(self.t("Provjeri promjene", "Check for changes")))
-                .clicked()
-            {
-                self.check();
-            }
-            if ui
-                .add_enabled(idle && needs_update, big(self.t("Ažuriraj", "Update")))
-                .clicked()
-            {
-                self.update();
-            }
-            let play_label = if needs_update {
-                self.t("Ažuriraj i igraj", "Update & play")
-            } else if delegated {
-                self.t("Igraj u Modrinthu", "Play in Modrinth")
-            } else {
-                self.t("Igraj", "Play")
-            };
-            if ui
-                .add_enabled(
-                    idle && can_play && (installed || needs_update),
-                    big(play_label).fill(Color32::from_rgb(40, 120, 60)),
-                )
-                .clicked()
-            {
-                if needs_update {
-                    self.play_after_update = true;
-                    self.update();
-                } else {
-                    self.play();
+        let installed = self
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.installed_version.is_some());
+        egui::Frame::new()
+            .fill(Color32::from_rgb(29, 44, 37))
+            .corner_radius(12)
+            .inner_margin(24)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("JAN'S COLLECTION")
+                        .color(GREEN)
+                        .strong()
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+                ui.heading(RichText::new("Fabric 26.3").size(34.0));
+                ui.label("Your shared modpack. Fetch updates, manage content and launch the game.");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            idle && (installed || needs_update),
+                            egui::Button::new(RichText::new("Play").strong())
+                                .fill(Color32::from_rgb(27, 125, 79))
+                                .min_size(egui::vec2(130.0, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        if self.account.is_none() {
+                            self.tab = Tab::Settings;
+                        } else if needs_update {
+                            self.play_after_update = true;
+                            self.update();
+                        } else {
+                            self.play();
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new("Fetch · Check updates")
+                                .min_size(egui::vec2(160.0, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        self.check();
+                    }
+                    if ui
+                        .add_enabled(
+                            idle && needs_update,
+                            egui::Button::new("Download update").min_size(egui::vec2(150.0, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        self.update();
+                    }
+                });
+                ui.add_space(6.0);
+                if self.account.is_none() {
+                    ui.label(
+                        RichText::new("Sign in with Microsoft in Settings to play.").color(AMBER),
+                    );
                 }
-            }
+            });
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            let count = self
+                .changes
+                .as_ref()
+                .map(|c| {
+                    c.manifest
+                        .files
+                        .iter()
+                        .filter(|f| f.folder() == "mods")
+                        .count()
+                })
+                .unwrap_or(0);
+            ui.label(RichText::new(format!("{count} {}", "pack mods")).strong());
+            ui.separator();
+            ui.label("Existing configs are preserved");
+            ui.separator();
+            ui.label("SHA512-verified downloads");
         });
-        ui.add_space(6.0);
-
+        ui.label(
+            RichText::new(self.settings.instance_dir().display().to_string())
+                .weak()
+                .size(12.0),
+        );
+        ui.add_space(12.0);
+        ui.heading("Pack activity");
         let Some(c) = self.changes.clone() else {
             return;
         };
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(format!(
-                "{} {}   →   {} {} (build {})",
-                self.t("Instalirano:", "Installed:"),
-                c.installed_version.as_deref().unwrap_or(self.t("ništa", "nothing")),
-                self.t("Najnovije:", "Newest:"),
-                c.new_version,
-                c.new_build
-            ));
-            if c.up_to_date() {
-                ui.label(RichText::new(self.t("Sve je ažurno.", "Everything is up to date.")).color(GREEN));
-            } else {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("Fetch revision: {}", c.revision))
+                        .weak()
+                        .size(11.0),
+                );
                 ui.label(format!(
-                    "{} {}",
-                    self.t("Za preuzeti:", "To download:"),
-                    util::human_bytes(c.download_bytes)
+                    "{} {}   →   {} {} (build {})",
+                    "Installed:",
+                    c.installed_version.as_deref().unwrap_or("nothing"),
+                    "Newest:",
+                    c.new_version,
+                    c.new_build
                 ));
-            }
-            for e in &c.changelog {
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("{}  ·  {}", e.version, e.date)).strong().size(16.0));
-                if e.text.trim().is_empty() {
-                    ui.label(RichText::new(self.t("(bez bilješki)", "(no notes)")).weak());
+                if c.up_to_date() {
+                    ui.label(RichText::new("Everything is up to date.").color(GREEN));
                 } else {
-                    ui.label(e.text.trim());
+                    ui.label(format!(
+                        "{} {}",
+                        "To download:",
+                        util::human_bytes(c.download_bytes)
+                    ));
                 }
-            }
-            if c.first_install && !c.added.is_empty() {
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("{} ({})", self.t("Prva instalacija", "First install"), c.added.len())).strong());
-                ui.collapsing(self.t("Sadržaj packa", "Pack contents"), |ui| {
-                    for i in &c.added {
-                        ui.label(format!("{}  {}", i.name, i.version.as_deref().unwrap_or("")));
-                    }
-                });
-                return;
-            }
-            let section = |ui: &mut egui::Ui, title: &str, n: usize| {
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("{title} ({n})")).strong());
-            };
-            if !c.added.is_empty() {
-                section(ui, self.t("Dodano", "Added"), c.added.len());
-                for i in &c.added {
-                    ui.label(RichText::new(format!("+ {}  {}", item_name(i), i.version.as_deref().unwrap_or(""))).color(GREEN));
-                }
-            }
-            if !c.updated.is_empty() {
-                section(ui, self.t("Ažurirano", "Updated"), c.updated.len());
-                for (o, n) in &c.updated {
+                for e in &c.changelog {
+                    ui.add_space(8.0);
                     ui.label(
-                        RichText::new(format!(
-                            "~ {}  {} → {}",
-                            item_name(n),
-                            o.version.as_deref().unwrap_or("?"),
-                            n.version.as_deref().unwrap_or("?")
-                        ))
-                        .color(AMBER),
+                        RichText::new(format!("{}  ·  {}", e.version, e.date))
+                            .strong()
+                            .size(16.0),
                     );
+                    if e.text.trim().is_empty() {
+                        ui.label(RichText::new("(no notes)").weak());
+                    } else {
+                        ui.label(e.text.trim());
+                    }
                 }
-            }
-            if !c.removed.is_empty() {
-                section(ui, self.t("Uklonjeno", "Removed"), c.removed.len());
-                for i in &c.removed {
-                    ui.label(RichText::new(format!("- {}", item_name(i))).color(RED));
+                if c.first_install && !c.added.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("{} ({})", "First install", c.added.len())).strong(),
+                    );
+                    ui.collapsing("Pack contents", |ui| {
+                        for i in &c.added {
+                            ui.label(format!(
+                                "{}  {}",
+                                i.name,
+                                i.version.as_deref().unwrap_or("")
+                            ));
+                        }
+                    });
+                    return;
                 }
-            }
-            if c.other_files_changed > 0 {
-                ui.add_space(8.0);
-                ui.label(format!(
-                    "{} {}",
-                    c.other_files_changed,
-                    self.t(
-                        "ostalih datoteka (configovi) promijenjeno; tvoji postojeći configovi se ne prepisuju.",
+                let section = |ui: &mut egui::Ui, title: &str, n: usize| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("{title} ({n})")).strong());
+                };
+                if !c.added.is_empty() {
+                    section(ui, "Added", c.added.len());
+                    for i in &c.added {
+                        ui.label(
+                            RichText::new(format!(
+                                "+ {}  {}",
+                                item_name(i),
+                                i.version.as_deref().unwrap_or("")
+                            ))
+                            .color(GREEN),
+                        );
+                    }
+                }
+                if !c.updated.is_empty() {
+                    section(ui, "Updated", c.updated.len());
+                    for (o, n) in &c.updated {
+                        ui.label(
+                            RichText::new(format!(
+                                "~ {}  {} → {}",
+                                item_name(n),
+                                o.version.as_deref().unwrap_or("?"),
+                                n.version.as_deref().unwrap_or("?")
+                            ))
+                            .color(AMBER),
+                        );
+                    }
+                }
+                if !c.removed.is_empty() {
+                    section(ui, "Removed", c.removed.len());
+                    for i in &c.removed {
+                        ui.label(RichText::new(format!("- {}", item_name(i))).color(RED));
+                    }
+                }
+                if c.other_files_changed > 0 {
+                    ui.add_space(8.0);
+                    ui.label(format!(
+                        "{} {}",
+                        c.other_files_changed,
                         "other files (configs) changed; your existing configs are not overwritten."
-                    )
-                ));
-            }
-        });
+                    ));
+                }
+            });
     }
 
     fn ui_account(&mut self, ui: &mut egui::Ui) {
-        if std::env::var("JANS_LAUNCHER_OFFLINE").is_ok() {
-            ui.label(RichText::new("Offline test mode").color(AMBER));
-            return;
-        }
         if let Some(code) = self.device_code.clone() {
-            ui.label(self.t(
-                "Upiši ovaj kod na Microsoftovoj stranici:",
-                "Enter this code on Microsoft's page:",
-            ));
+            ui.label("Enter this code on Microsoft's page:");
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(&code.user_code)
@@ -743,10 +817,10 @@ impl App {
                         .strong()
                         .monospace(),
                 );
-                if ui.button(self.t("Kopiraj", "Copy")).clicked() {
+                if ui.button("Copy").clicked() {
                     ui.ctx().copy_text(code.user_code.clone());
                 }
-                if ui.button(self.t("Otvori stranicu", "Open page")).clicked() {
+                if ui.button("Open page").clicked() {
                     let _ = open::that(&code.verification_uri);
                 }
             });
@@ -756,11 +830,8 @@ impl App {
             Some(a) => {
                 let name = a.name.clone();
                 ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{} {name}",
-                        self.t("Prijavljen kao", "Logged in as")
-                    ));
-                    if ui.small_button(self.t("Odjava", "Log out")).clicked() {
+                    ui.label(format!("{} {name}", "Logged in as"));
+                    if ui.small_button("Log out").clicked() {
                         Account::forget();
                         self.account = None;
                     }
@@ -770,7 +841,7 @@ impl App {
                 if ui
                     .add_enabled(
                         self.busy.is_none(),
-                        egui::Button::new(self.t("Prijava s Microsoftom", "Log in with Microsoft")),
+                        egui::Button::new("Log in with Microsoft"),
                     )
                     .clicked()
                 {
@@ -778,107 +849,54 @@ impl App {
                 }
             }
             None => {
-                ui.label(RichText::new(self.t(
-                    "Microsoft prijava još nije uključena. Ažuriraj pack ovdje, a igraj preko Modrinth Appa (Postavke → mapa instance = tvoj Modrinth profil).",
-                    "Microsoft login is not enabled yet. Update the pack here and play through Modrinth App (Settings → instance folder = your Modrinth profile).",
-                )).color(AMBER));
-                if ui
-                    .button(self.t("Otvori Modrinth App", "Open Modrinth App"))
-                    .clicked()
-                {
-                    let _ = open::that("modrinth://");
-                }
+                ui.label(RichText::new("Microsoft sign-in needs application registration. Pack and mod downloads work independently; playing requires sign-in setup.").color(AMBER));
+                ui.hyperlink_to(
+                    "Registration guide",
+                    "https://github.com/bozmund/jans-launcher/blob/main/docs/MICROSOFT_LOGIN.md",
+                );
             }
         }
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        if self.busy == Some(Busy::LoggingIn) {
+            self.ui_account(ui);
+            return;
+        }
         if self.busy.is_some() {
-            ui.label(self.t(
-                "Pričekaj završetak trenutne radnje prije promjene postavki.",
-                "Wait for the current operation before changing settings.",
-            ));
+            ui.label("Wait for the current operation before changing settings.");
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.ui_account(ui);
+            ui.separator();
             let mut dirty = false;
-            ui.heading(self.t("Mapa instance", "Instance folder"));
-            ui.label(self.settings.instance_dir().display().to_string());
+            ui.heading("Microsoft sign-in");
+            ui.label("One application registration enables sign-in for all players. Enter your password only on Microsoft's website.");
             ui.horizontal(|ui| {
-                if ui.button(self.t("Odaberi…", "Choose…")).clicked()
-                    && let Some(p) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.settings.instance_dir = Some(p);
-                    dirty = true;
-                }
-                if ui.button(self.t("Zadano", "Default")).clicked() {
-                    self.settings.instance_dir = None;
-                    dirty = true;
-                }
-                if ui.button(self.t("Otvori mapu", "Open folder")).clicked() {
-                    let d = self.settings.instance_dir();
-                    let _ = std::fs::create_dir_all(&d);
-                    let _ = open::that(d);
+                ui.label("Application (client) ID:");
+                let mut id=self.settings.msa_client_id.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut id).desired_width(340.0).hint_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")).changed() {
+                    self.settings.msa_client_id=(!id.trim().is_empty()).then(||id.trim().into());dirty=true;
                 }
             });
-            if !self.profiles.is_empty() {
-                egui::ComboBox::from_id_salt("use-profile")
-                    .selected_text(self.t("Koristi postojeći profil…", "Use an existing profile…"))
-                    .show_ui(ui, |ui| {
-                        for (label, path) in self.profiles.clone() {
-                            if ui.selectable_label(false, label).clicked() {
-                                self.settings.instance_dir = Some(path);
-                                dirty = true;
-                            }
-                        }
-                    });
-            }
-
+            ui.hyperlink_to("Registration: step by step","https://github.com/bozmund/jans-launcher/blob/main/docs/MICROSOFT_SETUP.md");
+            ui.add_space(16.0);
             ui.add_space(10.0);
-            ui.heading(self.t("Uvoz iz drugog launchera", "Import from another launcher"));
-            ui.label(self.t(
-                "Kopira svjetove, options.txt, servers.dat i screenshotove. Ništa postojeće se ne prepisuje.",
-                "Copies worlds, options.txt, servers.dat and screenshots. Nothing existing is overwritten.",
-            ));
+            ui.heading("Game");
             ui.horizontal(|ui| {
-                let sel = self
-                    .profiles
-                    .iter()
-                    .find(|p| Some(&p.1) == self.import_from.as_ref())
-                    .map(|p| p.0.clone())
-                    .unwrap_or_else(|| "-".into());
-                egui::ComboBox::from_id_salt("import-from").selected_text(sel).show_ui(ui, |ui| {
-                    for (label, path) in self.profiles.clone() {
-                        ui.selectable_value(&mut self.import_from, Some(path), label);
-                    }
-                });
-                let target = self.settings.instance_dir();
-                let ok = self.busy.is_none() && self.import_from.as_ref().is_some_and(|f| f != &target);
-                if ui.add_enabled(ok, egui::Button::new(self.t("Uvezi", "Import"))).clicked() {
-                    let from = self.import_from.clone().unwrap();
-                    self.busy = Some(Busy::Importing);
-                    self.settings.imported_from = Some(from.clone());
-                    dirty = true;
-                    let send = self.sender();
-                    self.rt.spawn_blocking(move || send(Msg::Imported(import::import(&from, &target))));
-                }
-            });
-
-            ui.add_space(10.0);
-            ui.heading(self.t("Igra", "Game"));
-            ui.horizontal(|ui| {
-                ui.label(self.t("Memorija (MB):", "Memory (MB):"));
+                ui.label("Memory (MB):");
                 dirty |= ui.add(egui::Slider::new(&mut self.settings.memory_mb, 2048..=32768).step_by(512.0)).changed();
             });
             if let Some(rec) = self.changes.as_ref().and_then(|c| c.manifest.recommended_memory_mb) {
-                ui.label(RichText::new(format!("{} {rec} MB", self.t("Preporučeno:", "Recommended:"))).weak());
+                ui.label(RichText::new(format!("{} {rec} MB", "Recommended:")).weak());
             }
             ui.horizontal(|ui| {
-                ui.label(self.t("Dodatni JVM argumenti:", "Extra JVM arguments:"));
+                ui.label("Extra JVM arguments:");
                 dirty |= ui.text_edit_singleline(&mut self.settings.extra_jvm_args).changed();
             });
             ui.horizontal(|ui| {
-                ui.label(self.t("Java (prazno = automatski):", "Java (empty = automatic):"));
+                ui.label("Java (empty = automatic):");
                 let mut s = self.settings.java_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 if ui.text_edit_singleline(&mut s).changed() {
                     self.settings.java_path = (!s.trim().is_empty()).then(|| PathBuf::from(s.trim()));
@@ -887,24 +905,16 @@ impl App {
             });
 
             ui.add_space(10.0);
-            ui.collapsing(self.t("Napredno", "Advanced"), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(self.t("Izvor packa:", "Pack source:"));
-                    dirty |= ui.text_edit_singleline(&mut self.settings.pack_source).changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Azure client ID:");
-                    let mut s = self.settings.msa_client_id.clone().unwrap_or_default();
-                    if ui.text_edit_singleline(&mut s).changed() {
-                        self.settings.msa_client_id = (!s.trim().is_empty()).then(|| s.trim().to_string());
-                        dirty = true;
-                    }
-                });
-                let label = self.t("Provjeravaj nove verzije launchera", "Check for launcher updates");
+            ui.collapsing("Advanced", |ui| {
+                let label = "Check for launcher updates";
                 dirty |= ui.checkbox(&mut self.settings.check_app_updates, label).changed();
                 ui.label(RichText::new(format!("jans-launcher {}  ·  {}", env!("CARGO_PKG_VERSION"), config::data_dir().display())).weak());
             });
             if dirty {
+                self.mod_plan=None;
+                self.mod_updates=None;
+                self.inventory.clear();
+                self.catalog_result=None;
                 self.settings_dirty = true;
                 if let Err(e) = self.settings.save() {
                     self.error = Some(format!("{e:#}"));
@@ -915,10 +925,10 @@ impl App {
 
     fn ui_log(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button(self.t("Kopiraj sve", "Copy all")).clicked() {
+            if ui.button("Copy all").clicked() {
                 ui.ctx().copy_text(self.log.join("\n"));
             }
-            if ui.button(self.t("Očisti", "Clear")).clicked() {
+            if ui.button("Clear").clicked() {
                 self.log.clear();
             }
         });
@@ -947,13 +957,331 @@ impl eframe::App for App {
         }
         egui::Panel::top("top").show(ui, |ui| self.ui_top(ui));
         egui::Panel::bottom("bottom").show(ui, |ui| self.ui_bottom(ui));
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Home => self.ui_home(ui),
-            Tab::Settings => self.ui_settings(ui),
-            Tab::Log => self.ui_log(ui),
-        });
+        egui::Panel::left("navigation")
+            .exact_size(220.0)
+            .resizable(false)
+            .show(ui, |ui| self.ui_sidebar(ui));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(23, 25, 29))
+                    .inner_margin(24),
+            )
+            .show(ui, |ui| match self.tab {
+                Tab::Home => self.ui_home(ui),
+                Tab::Discover => self.ui_discover(ui),
+                Tab::Installed => self.ui_installed(ui),
+                Tab::Updates => self.ui_mod_updates(ui),
+                Tab::Settings => self.ui_settings(ui),
+                Tab::Log => self.ui_log(ui),
+            });
         if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+impl App {
+    fn game_version(&self) -> String {
+        config::PACK_MINECRAFT.into()
+    }
+
+    fn search_mods(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(Busy::Catalog);
+        self.error = None;
+        let (client, query, game, offset, send) = (
+            self.client.clone(),
+            self.query.clone(),
+            self.game_version(),
+            self.catalog_offset,
+            self.sender(),
+        );
+        self.rt.spawn(async move {
+            send(Msg::CatalogSearch(
+                catalog::search(&client, &query, &game, offset).await,
+            ));
+        });
+    }
+
+    fn load_inventory(&mut self, updates: bool) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(Busy::Catalog);
+        self.error = None;
+        let (client, path, game, send) = (
+            self.client.clone(),
+            self.settings.instance_dir(),
+            self.game_version(),
+            self.sender(),
+        );
+        self.rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || catalog::inventory(&path)).await;
+            match result {
+                Ok(Ok(mods)) if updates => send(Msg::ModUpdates(
+                    catalog::updates(&client, &mods, &game).await,
+                )),
+                Ok(result) => send(Msg::Inventory(result)),
+                Err(e) => {
+                    if updates {
+                        send(Msg::ModUpdates(Err(e.into())));
+                    } else {
+                        send(Msg::Inventory(Err(e.into())));
+                    }
+                }
+            }
+        });
+    }
+
+    fn prepare_mod(&mut self, project: String, version: Option<catalog::Version>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(Busy::Catalog);
+        self.mod_plan = None;
+        self.error = None;
+        let (client, path, game, send) = (
+            self.client.clone(),
+            self.settings.instance_dir(),
+            self.game_version(),
+            self.sender(),
+        );
+        self.rt.spawn(async move {
+            let r = async {
+                let previous =
+                    tokio::task::spawn_blocking(move || catalog::inventory(&path)).await??;
+                let v = match version {
+                    Some(v) => v,
+                    None => catalog::versions(&client, &project, &game)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .context("No compatible Fabric version")?,
+                };
+                catalog::prepare(&client, v, &game, previous).await
+            }
+            .await;
+            send(Msg::ModPlan(r));
+        });
+    }
+
+    fn ui_mod_plan(&mut self, ui: &mut egui::Ui) {
+        let Some(plan) = self.mod_plan.clone() else {
+            return;
+        };
+        egui::Frame::new().fill(Color32::from_rgb(37,46,40)).corner_radius(10).inner_margin(18).show(ui,|ui| {
+            ui.heading("Confirm installation");
+            ui.label("Selected mod and required dependencies:");
+            for v in &plan.versions {ui.label(format!("{} · {}",v.name,v.version_number));}
+            ui.label(RichText::new("The next pack Update may restore pack-owned mods. Installation does not guarantee compatibility with every other mod.").color(AMBER));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.busy.is_none(),egui::Button::new("Install").fill(Color32::from_rgb(27,125,79))).clicked() {
+                    self.busy=Some(Busy::InstallingMod);
+                    let (client,instance,progress,send)=(self.client.clone(),self.settings.instance_dir(),self.progress_fn(),self.sender());
+                    self.rt.spawn(async move {send(Msg::ModInstalled(catalog::install(&client,&instance,plan,progress).await));});
+                }
+                if ui.add_enabled(self.busy.is_none(),egui::Button::new("Cancel")).clicked(){self.mod_plan=None;}
+            });
+        });
+        ui.add_space(12.0);
+    }
+
+    fn ui_discover(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Discover mods");
+        ui.label(
+            RichText::new(format!("Modrinth catalog · Fabric {}", self.game_version())).weak(),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let response = ui.add_sized(
+                [ui.available_width() - 150.0, 36.0],
+                egui::TextEdit::singleline(&mut self.query).hint_text("Search mods…"),
+            );
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(self.busy.is_none(), egui::Button::new("Search"))
+                .clicked()
+                || enter
+            {
+                self.catalog_offset = 0;
+                self.search_mods();
+            }
+        });
+        self.ui_mod_plan(ui);
+        let result = self.catalog_result.clone();
+        if let Some(result) = result {
+            ui.label(format!("{} {}", result.total_hits, "results"));
+            egui::ScrollArea::vertical()
+                .id_salt("catalog-results")
+                .show(ui, |ui| {
+                    for hit in result.hits {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(31, 34, 40))
+                            .corner_radius(9)
+                            .inner_margin(16)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(hit.title.clone()).size(20.0).strong());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    self.busy.is_none(),
+                                                    egui::Button::new("Install preview"),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.prepare_mod(hit.project_id.clone(), None);
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.label(hit.description);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {} downloads",
+                                            hit.author, hit.downloads
+                                        ))
+                                        .weak()
+                                        .size(12.0),
+                                    );
+                                    ui.hyperlink_to(
+                                        "Details",
+                                        format!("https://modrinth.com/mod/{}", hit.slug),
+                                    );
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.busy.is_none() && self.catalog_offset >= 20,
+                                egui::Button::new("Previous"),
+                            )
+                            .clicked()
+                        {
+                            self.catalog_offset -= 20;
+                            self.search_mods();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.busy.is_none()
+                                    && (self.catalog_offset as u64 + 20) < result.total_hits,
+                                egui::Button::new("Next"),
+                            )
+                            .clicked()
+                        {
+                            self.catalog_offset += 20;
+                            self.search_mods();
+                        }
+                    });
+                });
+        }
+    }
+
+    fn ui_installed(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Installed mods");
+            if ui
+                .add_enabled(self.busy.is_none(), egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.load_inventory(false);
+            }
+        });
+        ui.label("Mods installed in your Fabric 26.3 modpack.");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.mod_filter)
+                .hint_text("Filter mods…")
+                .desired_width(f32::INFINITY),
+        );
+        let filter = self.mod_filter.to_lowercase();
+        let mods = self.inventory.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("installed-mods")
+            .show(ui, |ui| {
+                for m in mods
+                    .iter()
+                    .filter(|m| m.name.to_lowercase().contains(&filter))
+                {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(31, 34, 40))
+                        .corner_radius(8)
+                        .inner_margin(12)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&m.name).strong().size(17.0));
+                                    ui.label(
+                                        RichText::new(format!("{} · {}", m.version, m.path))
+                                            .weak()
+                                            .size(12.0),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(if m.pack_owned {
+                                                "Pack managed"
+                                            } else {
+                                                "Personal mod"
+                                            })
+                                            .color(if m.pack_owned { GREEN } else { AMBER })
+                                            .size(12.0),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(5.0);
+                }
+                if mods.is_empty() {
+                    ui.label("The modpack is not installed yet. Download it from Overview.");
+                }
+            });
+    }
+
+    fn ui_mod_updates(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Mod updates");
+            if ui
+                .add_enabled(self.busy.is_none(), egui::Button::new("Check"))
+                .clicked()
+            {
+                self.load_inventory(true);
+            }
+        });
+        ui.label("Only versions for the active Minecraft and Fabric. Custom ports update through pack Fetch.");
+        self.ui_mod_plan(ui);
+        let updates = self.mod_updates.clone();
+        if let Some(updates) = updates {
+            if updates.is_empty() {
+                ui.label(
+                    RichText::new("No newer compatible Modrinth versions found.").color(GREEN),
+                );
+            }
+            egui::ScrollArea::vertical().id_salt("upstream-updates").show(ui,|ui| {
+                for update in updates {
+                    egui::Frame::new().fill(Color32::from_rgb(31,34,40)).corner_radius(8).inner_margin(14).show(ui,|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui|{
+                                ui.label(RichText::new(&update.installed.name).strong().size(18.0));
+                                ui.label(format!("{} → {}",update.installed.version,update.version.version_number));
+                            });
+                            if ui.add_enabled(self.busy.is_none(),egui::Button::new("Update preview")).clicked(){self.prepare_mod(update.version.project_id.clone(),Some(update.version.clone()));}
+                        });
+                        if update.installed.pack_owned {ui.label(RichText::new("Pack-managed; next pack Update restores the pack version.").color(AMBER).size(12.0));}
+                    });
+                    ui.add_space(8.0);
+                }
+            });
         }
     }
 }
