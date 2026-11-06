@@ -5,6 +5,7 @@ mod config;
 mod manifest;
 mod modrinth_setup;
 mod publish;
+mod selfupdate;
 mod source;
 mod sync;
 mod transaction;
@@ -123,6 +124,8 @@ fn main() {
 }
 
 enum Message {
+    AppChecked(Result<Option<selfupdate::AppRelease>>),
+    AppInstalled(Result<()>),
     Profiles(Result<Vec<Profile>>),
     Checked(Result<sync::Changes>),
     Applied(Result<()>),
@@ -130,6 +133,9 @@ enum Message {
     NativeProfile(Result<Option<PathBuf>>),
 }
 struct App {
+    app_busy: bool,
+    app_release: Option<selfupdate::AppRelease>,
+    app_status: String,
     close_to_tray: bool,
     resident_started: bool,
     setup_archive: Option<PathBuf>,
@@ -168,6 +174,9 @@ impl App {
                 .and_then(|b| serde_json::from_slice(&b).ok())
         });
         let mut app = Self {
+            app_busy: false,
+            app_release: None,
+            app_status: String::new(),
             close_to_tray: false,
             resident_started: false,
             setup_archive: modrinth_setup::pending_archive(),
@@ -188,6 +197,12 @@ impl App {
             error: None,
         };
         app.refresh();
+        app.check_app_update();
+        if updater_background::enrollment().ok().flatten().is_some_and(|e| e.enabled) {
+            if let Err(e) = updater_background::start_resident() {
+                app.error = Some(format!("Background updater could not start: {e:#}"));
+            }
+        }
         app
     }
     fn sender(&self) -> impl Fn(Message) + Send + 'static {
@@ -196,6 +211,34 @@ impl App {
             let _ = tx.send(message);
             ctx.request_repaint();
         }
+    }
+    fn check_app_update(&mut self) {
+        self.app_busy = true;
+        self.app_status = "Checking for app updates…".into();
+        let (client, send) = (self.client.clone(), self.sender());
+        self.runtime.spawn(async move {
+            send(Message::AppChecked(selfupdate::check_for(&client, config::APP_REPO, selfupdate::AppKind::Updater).await));
+        });
+    }
+    fn install_app_update(&mut self) {
+        let Some(release) = self.app_release.clone() else { return; };
+        self.app_busy = true;
+        self.busy = true;
+        self.app_status = "Finishing background work, then downloading the app update. The updater will restart…".into();
+        let (client, send) = (self.client.clone(), self.sender());
+        self.runtime.spawn(async move {
+            let result = async {
+                let was_running = updater_background::stop_for_app_update().await?;
+                let result = selfupdate::install(&client, &release).await;
+                if result.is_err() && was_running {
+                    if let Err(e) = updater_background::start_resident() {
+                        return Err(anyhow::anyhow!("App update failed: {}. Background restart also failed: {e:#}", result.unwrap_err()));
+                    }
+                }
+                result
+            }.await;
+            send(Message::AppInstalled(result));
+        });
     }
     fn refresh(&mut self) {
         self.busy = true;
@@ -258,8 +301,29 @@ impl App {
     }
     fn messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
-            self.busy = false;
+            if !matches!(&message, Message::AppChecked(_) | Message::AppInstalled(_)) {
+                self.busy = false;
+            }
             match message {
+                Message::AppChecked(result) => {
+                    self.app_busy = false;
+                    match result {
+                        Ok(release) => {
+                            self.app_status = release.as_ref().map(|r|format!("App update available: {}",r.version))
+                                .unwrap_or_else(||"Your updater app is up to date.".into());
+                            self.app_release = release;
+                        },
+                        Err(e) => self.app_status = format!("Cannot check app updates: {e:#}. You can retry."),
+                    }
+                }
+                Message::AppInstalled(result) => {
+                    self.app_busy = false;
+                    self.busy = false;
+                    match result {
+                        Ok(()) => selfupdate::restart(),
+                        Err(e) => self.app_status = format!("App update failed: {e:#}. Your profiles are unchanged; retry when ready."),
+                    }
+                }
                 Message::Profiles(Ok(profiles)) => {
                     self.profiles = profiles;
                     let owned: Vec<_> = self
@@ -348,6 +412,20 @@ impl eframe::App for App {
         );
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(23,25,29)).inner_margin(24)).show(ui,|ui| {
             ui.heading(RichText::new("Jan's Modpack Updater").size(28.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("App version {}", env!("CARGO_PKG_VERSION"))).strong());
+                if ui.add_enabled(!self.app_busy && !self.busy, egui::Button::new("Check for app updates")).clicked() {
+                    self.check_app_update();
+                }
+                if let Some(release) = self.app_release.clone() {
+                    if ui.add_enabled(!self.app_busy && !self.busy && self.setup_started.is_none(),
+                        egui::Button::new(format!("Update app to {}", release.version))).on_hover_text(&release.notes).clicked() {
+                        self.install_app_update();
+                    }
+                }
+                if self.app_busy { ui.spinner(); }
+            });
+            if !self.app_status.is_empty() { ui.small(&self.app_status); }
             ui.small("Close this window to keep updating in the Windows tray. Use Exit from the tray menu to stop the app.");
             ui.label("Install or update Jan's Fabric 26.3 pack. Keep playing through Modrinth.");
             ui.add_space(12.0);
@@ -458,6 +536,30 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn app_check_completion_does_not_unlock_an_active_pack_update() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App {
+            app_busy:true, app_release:None, app_status:String::new(),
+            close_to_tray:false, resident_started:false, setup_archive:None,
+            setup_started:None, setup_handoff:None,
+            runtime:tokio::runtime::Runtime::new().unwrap(), client:util::http(),
+            tx, rx, ctx:egui::Context::default(), profiles:vec![], selected:None,
+            copy_source:None, changes:None, busy:true,
+            progress:Arc::new(Mutex::new((String::new(),0,0))),
+            status:String::new(), error:None,
+        };
+        app.tx.send(Message::AppChecked(Ok(None))).unwrap();
+        app.messages();
+        assert!(app.busy, "A read-only app check cannot unlock a pack transaction");
+        assert!(!app.app_busy);
+        assert!(app.app_status.contains("up to date"));
+        app.app_busy=true;
+        app.tx.send(Message::AppChecked(Err(anyhow::anyhow!("fixture network failure")))).unwrap();
+        app.messages();
+        assert!(app.busy);
+        assert!(app.app_status.contains("retry"));
+    }
     #[test]
     fn profile_update_rechecks_loader_and_preserves_database_worlds_and_configs() {
         let root =

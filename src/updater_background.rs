@@ -58,6 +58,36 @@ fn save_status(state: &Status) -> Result<()> {
 pub fn request_exit() -> Result<()> {
     util::write_atomic(&config::data_dir().join("background-exit"), b"exit")
 }
+
+/// Wait for the worker to finish its current transaction, never terminate it mid-update.
+pub async fn stop_for_app_update() -> Result<bool> {
+    stop_worker_in(&config::data_dir(), Duration::from_secs(120)).await
+}
+
+async fn stop_worker_in(directory: &Path, timeout: Duration) -> Result<bool> {
+    fs::create_dir_all(directory)?;
+    let lock = fs::File::options().create(true).truncate(false).read(true).write(true)
+        .open(directory.join("background.lock"))?;
+    if lock.try_lock().is_ok() {
+        return Ok(false);
+    }
+    let exit = directory.join("background-exit");
+    util::write_atomic(&exit, b"exit")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if lock.try_lock().is_ok() {
+            match fs::remove_file(&exit) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(true);
+        }
+        ensure!(Instant::now() < deadline,
+            "The background pack update is still finishing. No files were interrupted. Retry the app update after it finishes");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 pub fn start_resident() -> Result<()> {
     #[cfg(windows)]
     {
@@ -212,13 +242,15 @@ pub fn disable() -> Result<()> {
 }
 #[cfg(windows)]
 fn installed_exe() -> Result<PathBuf> {
-    Ok(directories::BaseDirs::new()
+    let root = directories::BaseDirs::new()
         .context("Missing user data folder")?
-        .data_local_dir()
-        .join(format!(
-            "Jan's Modpack Updater/{}/jans-modpack-updater.exe",
-            env!("CARGO_PKG_VERSION")
-        )))
+        .data_local_dir().to_path_buf();
+    Ok(worker_executable(&root, env!("CARGO_PKG_VERSION"), env!("CARGO_BIN_NAME")))
+}
+
+fn worker_executable(root: &Path, version: &str, product: &str) -> PathBuf {
+    // The launcher's resident copy must never occupy the updater's executable path.
+    root.join("Jan's Modpack Updater").join(version).join(format!("{product}.exe"))
 }
 #[cfg(windows)]
 fn spawn_worker(exe: &Path) -> Result<()> {
@@ -311,6 +343,55 @@ pub async fn cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn launcher_and_updater_cannot_replace_each_others_resident_copy() {
+        let root = Path::new("user data with spaces");
+        let launcher = worker_executable(root, "0.4.4", "jans-launcher");
+        let updater = worker_executable(root, "0.4.4", "jans-modpack-updater");
+        assert_ne!(launcher, updater);
+        assert_eq!(launcher.file_name().unwrap(), "jans-launcher.exe");
+        assert_eq!(updater.file_name().unwrap(), "jans-modpack-updater.exe");
+        assert_ne!(updater, worker_executable(root, "0.4.3", "jans-modpack-updater"));
+    }
+    #[tokio::test]
+    async fn app_update_waits_for_worker_transaction_without_killing_it() {
+        let root = std::env::temp_dir().join(format!("jans-app-worker-stop-{}-{}",
+            std::process::id(), time::OffsetDateTime::now_utc().unix_timestamp_nanos()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(!stop_worker_in(&root, Duration::from_secs(1)).await.unwrap());
+        let lock = fs::File::options().read(true).write(true).open(root.join("background.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker_root.join("background-exit").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fs::write(worker_root.join("transaction-finished"), b"complete").unwrap();
+            drop(lock);
+        });
+        assert!(stop_worker_in(&root, Duration::from_secs(5)).await.unwrap());
+        worker.join().unwrap();
+        assert_eq!(fs::read(root.join("transaction-finished")).unwrap(), b"complete");
+        assert!(!root.join("background-exit").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_update_timeout_preserves_active_worker_and_data() {
+        let root = std::env::temp_dir().join(format!("jans-app-worker-timeout-{}-{}",
+            std::process::id(), time::OffsetDateTime::now_utc().unix_timestamp_nanos()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("profile-data"), b"keep").unwrap();
+        let lock = fs::File::options().create(true).truncate(false).read(true).write(true).open(root.join("background.lock")).unwrap();
+        lock.try_lock().unwrap();
+        assert!(stop_worker_in(&root, Duration::from_millis(10)).await.is_err());
+        assert_eq!(fs::read(root.join("profile-data")).unwrap(), b"keep");
+        assert!(root.join("background-exit").exists());
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
     struct Fixture {
         root: PathBuf,
         profile: PathBuf,
