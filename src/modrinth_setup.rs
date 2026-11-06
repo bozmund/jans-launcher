@@ -15,6 +15,9 @@ use std::{
     path::{Path, PathBuf},
 };
 const LEGACY_SHARED_ID: &str = "NKvb031t";
+#[cfg(windows)]
+#[path = "modrinth_windows.rs"]
+mod windows_installer;
 pub const MARKER: &str = ".jans-launcher/modrinth-import.json";
 pub struct SetupLease(fs::File);
 impl SetupLease {
@@ -421,7 +424,22 @@ pub fn export(
     Ok(path)
 }
 
-/// Choose an identified old profile; ambiguity is a user decision, never a guess.
+/// Populate the independent app instance before exporting a first-time Modrinth install.
+async fn populate_new_copy(
+    client: &reqwest::Client,
+    own: PathBuf,
+    fetched: source::Fetched,
+    progress: sync::ProgressFn,
+) -> Result<(PathBuf, String)> {
+    fs::create_dir_all(&own)?;
+    let loader = fetched.manifest.fabric_loader.clone();
+    let target = own.clone();
+    let changes = tokio::task::spawn_blocking(move || sync::plan(&target, fetched)).await??;
+    sync::apply(client, &own, &changes, progress).await?;
+    Ok((own, loader))
+}
+
+/// An existing Modrinth profile is optional: download the pack when there is nothing to copy.
 pub async fn prepare(
     client: &reqwest::Client,
     explicit: Option<PathBuf>,
@@ -470,13 +488,7 @@ pub async fn prepare(
             (p.directory, p.loader_version)
         } else {
             let own = config::Settings::load().single_pack().instance_dir();
-            fs::create_dir_all(&own)?;
-            let loader = fetched.manifest.fabric_loader.clone();
-            let target = own.clone();
-            let changes =
-                tokio::task::spawn_blocking(move || sync::plan(&target, fetched)).await??;
-            sync::apply(client, &own, &changes, progress.clone()).await?;
-            (own, loader)
+            populate_new_copy(client, own, fetched, progress.clone()).await?
         }
     };
     let output = config::data_dir().join("modrinth-imports");
@@ -493,33 +505,18 @@ pub fn open_installer(archive: Option<&Path>) -> Result<()> {
     };
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         // Use Modrinth's registered executable directly: do not accidentally import into another launcher.
-        let script = r#"$ErrorActionPreference='Stop'; (Get-ItemProperty -LiteralPath 'Registry::HKEY_CLASSES_ROOT\modrinth\shell\open\command').'(default)' | ConvertTo-Json -Compress"#;
-        let result = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(0x08000000)
-            .output()?;
-        ensure!(
-            result.status.success(),
-            "Install Modrinth App first. Your local copy is ready at {}",
+        let exe = windows_installer::executable().with_context(|| format!(
+            "Install and open Modrinth App first, then click Continue installation. Your prepared pack is safe at {}",
             archive.display()
-        );
-        let command: String = serde_json::from_slice(&result.stdout)?;
-        let exe = command
-            .trim()
-            .strip_prefix('"')
-            .and_then(|s| s.split_once('"'))
-            .map(|(s, _)| s)
-            .context(
-                "Cannot identify the Modrinth executable; open the local mrpack file in Modrinth",
-            )?;
+        ))?;
         ensure!(
-            Path::new(exe).is_file(),
+            exe.is_file(),
             "Modrinth is missing. Local archive: {}",
             archive.display()
         );
-        std::process::Command::new(exe).arg(archive).spawn()?;
+        std::process::Command::new(exe).arg(archive).spawn()
+            .context("Cannot start Modrinth with the prepared pack")?;
         Ok(())
     }
     #[cfg(not(windows))]
@@ -528,10 +525,65 @@ pub fn open_installer(archive: Option<&Path>) -> Result<()> {
     }
 }
 
+pub fn show_prepared_pack(archive: &Path) -> Result<()> {
+    ensure!(archive.is_file(), "The prepared pack is missing; create it again");
+    let folder = archive.parent().context("Prepared pack has no folder")?;
+    open::that(folder).context("Cannot open the prepared pack folder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[tokio::test]
+    async fn fresh_install_with_empty_modrinth_and_unicode_windows_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "jans-fresh-Božac-šđčćž-{}-{}",
+            std::process::id(), time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let app = root.join("Empty Modrinth");
+        fs::create_dir_all(&app).unwrap();
+        let db = rusqlite::Connection::open(app.join("app.db")).unwrap();
+        db.execute_batch("CREATE TABLE instances(name TEXT,path TEXT,applied_content_set_id TEXT);CREATE TABLE instance_content_sets(id TEXT,game_version TEXT,loader TEXT,loader_version TEXT);").unwrap();
+        drop(db);
+        let db_hash = util::sha512_file(&app.join("app.db")).unwrap();
+        assert!(updater_profiles::from_app_root(&app).unwrap().is_empty());
+        let source = root.join("Published pack");
+        fs::create_dir_all(&source).unwrap();
+        let mut jar = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        jar.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default()).unwrap();
+        jar.write_all(br#"{"schemaVersion":1,"id":"fresh_fixture","version":"1.0"}"#).unwrap();
+        let content = jar.finish().unwrap().into_inner();
+        fs::write(source.join("mod.jar"), &content).unwrap();
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "format":1,"name":"Jan's Fabric 26.3","build":1,"version":"fixture",
+            "minecraft":"26.3","fabric_loader":"0.20.1","files":[{
+                "path":"mods/fixture.jar","url":"mod.jar","size":content.len(),
+                "sha512":hex::encode(Sha512::digest(&content)),"policy":"managed"
+            }]
+        })).unwrap();
+        manifest.validate().unwrap();
+        let progress: sync::ProgressFn = Arc::new(|_,_,_|{});
+        let (own, loader) = populate_new_copy(&util::http(), root.join("App instance"),
+            source::Fetched { manifest, base: source.to_string_lossy().into_owned(), revision:"fixture".into() },
+            progress.clone()).await.unwrap();
+        let archive = export(&own, &loader, &root.join("Prepared packs"), progress).unwrap();
+        let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+        let index: serde_json::Value = serde_json::from_reader(zip.by_name("modrinth.index.json").unwrap()).unwrap();
+        assert_eq!(index["name"], "Jan's Fabric 26.3");
+        assert_eq!(index["dependencies"]["minecraft"], "26.3");
+        assert_eq!(index["dependencies"]["fabric-loader"], "0.20.1");
+        assert_eq!(index["files"], serde_json::json!([]));
+        let mut installed = vec![];
+        zip.by_name("overrides/mods/fixture.jar").unwrap().read_to_end(&mut installed).unwrap();
+        assert_eq!(installed, content);
+        assert!(zip.by_name(&format!("overrides/{MARKER}")).is_ok());
+        assert_eq!(pending_in(&root.join("Prepared packs")).unwrap().archive, archive);
+        assert_eq!(util::sha512_file(&app.join("app.db")).unwrap(), db_hash);
+        assert!(updater_profiles::from_app_root(&app).unwrap().is_empty(), "Modrinth alone registers the import after confirmation");
+        drop(zip);
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn only_one_setup_window_can_prepare_a_profile() {
         let root = std::env::temp_dir().join(format!(

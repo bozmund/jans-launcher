@@ -349,7 +349,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(23,25,29)).inner_margin(24)).show(ui,|ui| {
             ui.heading(RichText::new("Jan's Modpack Updater").size(28.0));
             ui.small("Close this window to keep updating in the Windows tray. Use Exit from the tray menu to stop the app.");
-            ui.label("Update your existing Fabric 26.3 profile. Keep playing through Modrinth.");
+            ui.label("Install or update Jan's Fabric 26.3 pack. Keep playing through Modrinth.");
             ui.add_space(12.0);
             egui::Frame::new().fill(Color32::from_rgb(30,44,37)).corner_radius(10).inner_margin(16).show(ui,|ui| {
                 ui.label(RichText::new("No Minecraft API approval or additional sign-in needed").color(Color32::LIGHT_GREEN));
@@ -372,8 +372,12 @@ impl eframe::App for App {
             }
             if cooldown{ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));}
             if let Some(started)=self.setup_started{let(stage,done,total)=self.progress.lock().unwrap().clone();modrinth_setup::setup_progress(ui,&stage,done,total,started.elapsed());}
-            else if self.setup_archive.is_some(){ui.colored_label(Color32::YELLOW,"Your copy is ready. Confirm Install in Modrinth and wait there. Continue reopens this same copy instead of creating a second one.");}
-            ui.small("Detects your old Jan's pack and copies its game settings and worlds into an independent profile. Confirm Install in Modrinth; keep the old profile as backup.");
+            else if let Some(path)=&self.setup_archive{
+                ui.colored_label(Color32::YELLOW,"Your pack is downloaded. Continue opens Modrinth's Install screen; confirm Install there. No existing profile is required.");
+                if ui.button("Open downloaded pack folder").clicked(){if let Err(e)=modrinth_setup::show_prepared_pack(path){self.error=Some(format!("{e:#}"));}}
+                ui.small("If the installer does not open, import the .mrpack from this folder in Modrinth. No second download is needed.");
+            }
+            ui.small("Creates a new profile even when Modrinth is empty. Existing pack settings and worlds are copied when available; the old profile stays intact.");
             let current=self.profiles.iter().find(|p|Some(&p.directory)==self.selected.as_ref()).map(|p|p.name.clone()).unwrap_or_else(||"Choose Fabric 26.3…".into());
             let mut chosen=None;
             ui.add_enabled_ui(!self.busy,|ui| {

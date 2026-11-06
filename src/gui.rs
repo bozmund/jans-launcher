@@ -762,9 +762,17 @@ impl App {
             let (stage, done, total) = self.progress.lock().unwrap().clone().unwrap_or_default();
             crate::modrinth_setup::setup_progress(ui, &stage, done, total, started.elapsed());
         } else if self.setup_archive.is_some() {
-            ui.colored_label(AMBER,"Your copy is prepared. In Modrinth, confirm Install and wait for installation to finish. Continue reopens the same copy; it does not create another one.");
+            ui.colored_label(AMBER,"Your pack is downloaded. Continue opens Modrinth's Install screen; confirm Install there. No existing Modrinth profile is required.");
+            if ui.button("Open downloaded pack folder").clicked() {
+                if let Some(path) = &self.setup_archive {
+                    if let Err(e) = crate::modrinth_setup::show_prepared_pack(path) {
+                        self.fail("Open pack folder", e);
+                    }
+                }
+            }
+            ui.small("If the installer does not open, import the .mrpack file from this folder in Modrinth. You do not need to download the pack again.");
         }
-        ui.small("Detects your Jan's pack and copies its game settings, mods and worlds into an independent profile. Your old profile stays intact. Confirm installation in Modrinth.");
+        ui.small("Installs Jan's pack into a new Modrinth profile. If you already have the pack, copies its settings and worlds and keeps the old profile intact.");
         if cfg!(windows) {
             ui.small("Closing this window keeps Jan's updater in the Windows tray. Right-click its icon and choose Exit to stop it.");
         }

@@ -1,0 +1,12 @@
+{
+  "current_windows_default": {
+    "exit": 0,
+    "valid_utf8_json": true,
+    "correct_executable_command": false
+  },
+  "central_european_1250": {
+    "exit": 0,
+    "valid_utf8_json": false,
+    "failure": "'utf-8' codec can't decode byte 0x9e in position 20: invalid start byte"
+  }
+}
