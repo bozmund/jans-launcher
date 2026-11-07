@@ -711,7 +711,7 @@ impl App {
                 }
             });
         ui.add_space(12.0);
-        ui.label("Play through Modrinth while standalone sign-in approval is pending.");
+        ui.label("Play here after signing in with Microsoft, or use your Modrinth profile below.");
         let cooldown = self
             .setup_handoff
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
@@ -982,7 +982,7 @@ impl App {
             ui.separator();
             let mut dirty = false;
             ui.heading("Microsoft sign-in");
-            ui.label("One application registration enables sign-in for all players. Enter your password only on Microsoft's website.");
+            ui.label("Jan's Launcher is registered for Minecraft sign-in. Use Log in with Microsoft above; no personal API key is needed. Enter your password only on Microsoft's website.");
             ui.horizontal(|ui| {
                 ui.label("Application (client) ID:");
                 let mut id=self.settings.msa_client_id.clone().unwrap_or_default();

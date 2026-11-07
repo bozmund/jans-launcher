@@ -205,7 +205,7 @@ async fn minecraft_from_ms(client: &reqwest::Client, ms: &Value) -> Result<Accou
         .await?;
     if mc_resp.status() == reqwest::StatusCode::FORBIDDEN {
         bail!(
-            "Minecraft refused this launcher's app id (403). The Azure app must be approved by Mojang first, see docs/MICROSOFT_LOGIN.md"
+            "Minecraft rejected the sign-in exchange (403). This does not identify the cause by itself. Check the registered client ID and Minecraft API permission, allow time for recent approval to propagate, and sign in again. See docs/MICROSOFT_LOGIN.md"
         );
     }
     let mc: Value = mc_resp

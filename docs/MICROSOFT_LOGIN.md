@@ -2,10 +2,12 @@
 
 Minecraft accounts are Microsoft accounts. A launcher logs in through an **Azure app registration**
 (a client id). Since 2023 Mojang only lets an app id use the Minecraft login API after it has been
-**approved**; until then the last step returns HTTP 403 and the launcher says so.
+**approved**. A 403 can also indicate an incorrect client ID or an access configuration problem.
 
-Until approval arrives, pack downloads and mod management work independently. Integrated Play
-requires configured Microsoft authentication; there is no automatic Modrinth App fallback.
+The owner has reported approval for Jan's registered client ID. Players can use **Log in with
+Microsoft**; they do not need to register another application or obtain an API key. Pack downloads
+and mod management work independently. Integrated Play requires Microsoft authentication;
+there is no automatic Modrinth App fallback. The registration steps below are for maintainers.
 Owner setup: [MICROSOFT_SETUP.md](MICROSOFT_SETUP.md).
 
 ## 1. Register the Azure app (free, ~5 minutes)
@@ -50,7 +52,7 @@ logged in.
 
 | Message | Meaning |
 |---|---|
-| Minecraft refused this launcher's app id (403) | Mojang has not approved the app id yet |
+| Minecraft refused this launcher's app id (403) | Check the registered client ID, Minecraft access permissions and approval propagation; this alone does not prove the application is unapproved |
 | this Microsoft account has no Xbox profile | Log in once at xbox.com to create one |
 | child account | The account must be added to a Microsoft family |
 | this account does not own Minecraft Java Edition | Wrong account, or game not bought |

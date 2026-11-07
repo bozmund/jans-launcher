@@ -58,7 +58,7 @@ Players do not need the admin application, Git, Python or a GitHub account.
 prepares an independent native import with the player's game settings and worlds preserved. Confirm
 Install in Modrinth. The original profile remains as a backup; the new copy uses Jan's updater instead
 of the old shared-instance update link. Local migration archives contain personal files and should
-not be shared. This route uses Modrinth's existing Minecraft sign-in while standalone approval is pending.
+not be shared. This route uses Modrinth's existing Minecraft sign-in as an alternative to standalone play.
 
 **Windows:** download `jans-launcher-windows-x86_64.exe` from the
 [latest release](../../releases/latest), put it anywhere (e.g. Desktop) and double-click it.
@@ -146,7 +146,8 @@ MIT
 Jan's Launcher requires Microsoft sign-in and current Minecraft Java entitlement/profile verification
 before starting gameplay. It has no offline-account or environment-variable authentication bypass.
 The public client ID is `ebddfc17-e502-4c3e-9d64-92711868988f`; it is not a client secret. Minecraft API
-review is pending and no authenticated end-to-end launch is claimed until the service accepts this app.
+access approval has been reported by the owner. Use **Log in with Microsoft** in Settings; players
+do not need an API key. A fresh authenticated end-to-end launch still needs player verification.
 
 NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
 
